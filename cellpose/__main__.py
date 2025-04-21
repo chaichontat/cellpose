@@ -10,7 +10,7 @@ from cellpose import utils, models, io, version_str, train, denoise
 from cellpose.cli import get_arg_parser
 
 try:
-    from cellpose.gui import gui3d, gui
+    from cellpose.gui import gui3d, gui, guiortho
     GUI_ENABLED = True
 except ImportError as err:
     GUI_ERROR = err
@@ -54,7 +54,9 @@ def main():
                     )
                     print("     pip install 'cellpose[gui]'")
             else:
-                if args.Zstack:
+                if args.ortho:
+                    guiortho.run()
+                elif args.Zstack:
                     gui3d.run()
                 else:
                     gui.run()
@@ -110,10 +112,10 @@ def main():
 
         if args.norm_percentile is not None:
             value1, value2 = args.norm_percentile
-            normalize = {'percentile': (float(value1), float(value2))} 
+            normalize = {'percentile': (float(value1), float(value2))}
         else:
             normalize = (not args.no_norm)
-        
+
 
         model_type = None
         if pretrained_model and not os.path.exists(pretrained_model):
@@ -245,12 +247,12 @@ def main():
                                           ratio=1.)
                 if saving_something:
                     suffix = "_cp_masks"
-                    if args.output_name is not None: 
+                    if args.output_name is not None:
                         # (1) If `savedir` is not defined, then must have a non-zero `suffix`
                         if args.savedir is None and len(args.output_name) > 0:
                             suffix = args.output_name
                         elif args.savedir is not None and not os.path.samefile(args.savedir, args.dir):
-                            # (2) If `savedir` is defined, and different from `dir` then                              
+                            # (2) If `savedir` is defined, and different from `dir` then
                             # takes the value passed as a param. (which can be empty string)
                             suffix = args.output_name
 

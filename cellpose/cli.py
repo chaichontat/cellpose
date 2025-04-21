@@ -22,6 +22,7 @@ def get_arg_parser():
         "--verbose", action="store_true",
         help="show information about running and settings and save to log")
     parser.add_argument("--Zstack", action="store_true", help="run GUI in 3D mode")
+    parser.add_argument("--ortho", action="store_true", help="run GUI in 3D mode")
 
     # settings for CPU vs GPU
     hardware_args = parser.add_argument_group("Hardware Arguments")
@@ -82,7 +83,7 @@ def get_arg_parser():
     model_args.add_argument("--pretrained_model_ortho", required=False, default=None,
                             type=str,
                             help="model to use for running 3D ortho views (ZY and ZX)")
-    
+
     # algorithm settings
     algorithm_args = parser.add_argument_group("Algorithm Arguments")
     algorithm_args.add_argument(
