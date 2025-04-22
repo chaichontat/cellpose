@@ -1124,14 +1124,73 @@ class MainW(QMainWindow):
         return images, idx
 
     def get_prev_image(self):
+        # Store current view state before loading the new image
+        current_view_rect = self.p0.viewRect()
+        current_saturation = copy.deepcopy(self.saturation)
+        current_z_index = self.currentZ
+
         images, idx = self.get_files()
         idx = (idx - 1) % len(images)
         io._load_image(self, filename=images[idx])
 
+        try:
+            # Restore zoom and position
+            self.p0.setRange(rect=current_view_rect, padding=0)
+
+            # Restore saturation for the current Z slice
+            # Check if the Z index from the previous image is valid for the new image's saturation structure
+            if self.currentZ < len(self.saturation[0]) and current_z_index < len(current_saturation[0]):
+                 for r in range(len(self.saturation)):
+                     if r < len(self.saturation) and r < len(current_saturation):
+                         if self.currentZ < len(self.saturation[r]) and current_z_index < len(current_saturation[r]):
+                             self.saturation[r][self.currentZ] = current_saturation[r][current_z_index]
+            else:
+                 print("GUI_WARNING: Z index mismatch or invalid state after loading previous image, applying default/first slice saturation.")
+            # Update sliders to reflect restored saturation
+            for r_idx, r_name in enumerate(["red", "green", "blue"]):
+                 if r_idx < len(self.saturation) and self.currentZ < len(self.saturation[r_idx]):
+                     self.sliders[r_idx].setValue(self.saturation[r_idx][self.currentZ])
+
+            # Refresh the plot
+            self.update_plot()
+        except Exception as e:
+            print(f"GUI_ERROR: Could not restore view state: {e}")
+
+
     def get_next_image(self, load_seg=True):
+         # Store current view state before loading the new image
+        current_view_rect = self.p0.viewRect()
+        current_saturation = copy.deepcopy(self.saturation)
+        current_z_index = self.currentZ
+
         images, idx = self.get_files()
         idx = (idx + 1) % len(images)
         io._load_image(self, filename=images[idx], load_seg=load_seg)
+
+        # Restore view state after loading the new image
+        try:
+            self.p0.setRange(rect=current_view_rect, padding=0)
+            # Restore saturation for the current Z slice
+            # Check if the Z index from the previous image is valid for the new image's saturation structure
+            if self.currentZ < len(self.saturation[0]) and current_z_index < len(current_saturation[0]):
+                 for r in range(len(self.saturation)):
+                     # Ensure channel index 'r' is valid for both current and previous saturation lists
+                     if r < len(self.saturation) and r < len(current_saturation):
+                         # Ensure Z indices are valid within their respective saturation lists for this channel
+                         if self.currentZ < len(self.saturation[r]) and current_z_index < len(current_saturation[r]):
+                             self.saturation[r][self.currentZ] = current_saturation[r][current_z_index]
+            else:
+                 print("GUI_WARNING: Z index mismatch or invalid state after loading next image, applying default/first slice saturation.")
+
+            # Update sliders to reflect restored saturation
+            for r_idx, r_name in enumerate(["red", "green", "blue"]):
+                 if r_idx < len(self.saturation) and self.currentZ < len(self.saturation[r_idx]):
+                     self.sliders[r_idx].setValue(self.saturation[r_idx][self.currentZ])
+
+            self.update_plot()
+        except Exception as e:
+            print(f"GUI_ERROR: Could not restore view state: {e}")
+
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
