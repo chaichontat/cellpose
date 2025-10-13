@@ -219,21 +219,31 @@ class MainW_ortho2D(MainW):
             basename = filepath.stem
             ext = filepath.suffix
 
-            # Try to find the Z index part (e.g., "basename-Z")
-            match = re.match(r'(.*)-(\d+)$', basename)
-            if match:
-                basename = match.group(1) + '-'
-                main_z_str = match.group(2)
-                main_z_index = int(main_z_str)
-                folder = filepath.parent
-                glob_pattern = str(folder / f"{basename}*{ext}")
+            # Try to find Z index using supported patterns:
+            #   (1) basename_z<idx>.<ext>  e.g., sample_z05.tif
+            #   (2) basename-<idx>.<ext>   e.g., sample-5.tif
+            folder = filepath.parent
+            m_z = re.match(r'^(.*)_z(\d+)$', basename)
+            m_dash = re.match(r'^(.*)-(\d+)$', basename)
+            if m_z or m_dash:
+                if m_z:
+                    family = m_z.group(1)
+                    main_z_index = int(m_z.group(2))
+                    glob_glob = f"{family}_z*{ext}"
+                    stem_regex = re.compile(rf'^{re.escape(family)}_z(\d+)$')
+                else:
+                    family = m_dash.group(1)
+                    main_z_index = int(m_dash.group(2))
+                    glob_glob = f"{family}-*{ext}"
+                    stem_regex = re.compile(rf'^{re.escape(family)}-(\d+)$')
+                glob_pattern = str(folder / glob_glob)
                 print(f"GUI_INFO: Globbing for Z-stack: {glob_pattern}")
 
                 z_files_dict = {}
-                potential_files = list(Path(folder).glob(f"{basename}*{ext}"))
+                potential_files = list(Path(folder).glob(glob_glob))
                 for fpath in potential_files:
                     fname_only = fpath.stem
-                    z_match = re.match(rf'{re.escape(basename)}(\d+)$', fname_only)
+                    z_match = stem_regex.match(fname_only)
                     if z_match:
                         z_idx = int(z_match.group(1))
                         z_files_dict[z_idx] = str(fpath)
@@ -327,7 +337,7 @@ class MainW_ortho2D(MainW):
                         print(f"GUI_INFO: Ortho stack loaded. Shape={self.stack_ortho.shape}, Main Z index={self.zc_ortho}")
 
             else:
-                print("GUI_WARNING: Filename does not match expected Z-stack pattern (basename-Z.ext). Cannot load ortho stack.")
+                print("GUI_WARNING: Filename does not match expected Z-stack pattern (basename_z##.ext or basename-#.ext). Cannot load ortho stack.")
                 self.ortho_nz = 1
                 self.stack_ortho = self.stack.copy() # Use main stack
                 self.zc_ortho = 0
