@@ -4,6 +4,7 @@ Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer a
 
 import sys, os, pathlib, warnings, datetime, time, copy
 
+import copy
 from qtpy import QtGui, QtCore
 from superqt import QRangeSlider, QCollapsible
 from qtpy.QtWidgets import QScrollArea, QMainWindow, QApplication, QWidget, QScrollBar, QComboBox, QGridLayout, QPushButton, QFrame, QCheckBox, QLabel, QProgressBar, QLineEdit, QMessageBox, QGroupBox
@@ -209,22 +210,22 @@ class MainW(QMainWindow):
         menus.modelmenu(self)
         menus.helpmenu(self)
 
-        self.stylePressed = """QPushButton {Text-align: center; 
-                             background-color: rgb(150,50,150); 
+        self.stylePressed = """QPushButton {Text-align: center;
+                             background-color: rgb(150,50,150);
                              border-color: white;
                              color:white;}
-                            QToolTip { 
-                           background-color: black; 
-                           color: white; 
+                            QToolTip {
+                           background-color: black;
+                           color: white;
                            border: black solid 1px
                            }"""
-        self.styleUnpressed = """QPushButton {Text-align: center; 
+        self.styleUnpressed = """QPushButton {Text-align: center;
                                background-color: rgb(50,50,50);
                                 border-color: white;
                                color:white;}
-                                QToolTip { 
-                           background-color: black; 
-                           color: white; 
+                                QToolTip {
+                           background-color: black;
+                           color: white;
                            border: black solid 1px
                            }"""
         self.loaded = False
@@ -740,7 +741,7 @@ class MainW(QMainWindow):
         self.l0.addWidget(self.denoiseBox, b, 0, 1, 9)
 
         b0 = 0
-        
+
         # DENOISING
         self.DenoiseButtons = []
         nett = [
@@ -1770,7 +1771,7 @@ class MainW(QMainWindow):
     def add_mask(self, points=None, color=(100, 200, 50), dense=True):
         # points is list of strokes
         points_all = np.concatenate(points, axis=0)
-        
+
         # loop over z values
         median = []
         zdraw = np.unique(points_all[:, 0])
@@ -1812,7 +1813,7 @@ class MainW(QMainWindow):
             acs = np.concatenate((acs, ac), axis=0)
             vrs = np.concatenate((vrs, vr), axis=0)
             vcs = np.concatenate((vcs, vc), axis=0)
-            
+
         self.draw_mask(z, ars, acs, vrs, vcs, color)
         median.append(np.array([np.median(ars), np.median(acs)]))
 
@@ -2227,7 +2228,7 @@ class MainW(QMainWindow):
             self.logger.info(f"training new model starting from scratch")
         self.current_model = model_type
         self.channels = self.training_params["channels"]
-        
+
         self.logger.info(
             f"training with chan = {self.ChannelChoose[0].currentText()}, chan2 = {self.ChannelChoose[1].currentText()}"
         )
@@ -2486,7 +2487,7 @@ class MainW(QMainWindow):
                 self.min_size, int) else self.min_size
             resample = self.resample.isChecked() if not isinstance(
                 self.resample, bool) else self.resample
-            
+
             do_3D = False if stitch_threshold > 0. else do_3D
 
             channels = self.get_channels()
@@ -2549,12 +2550,12 @@ class MainW(QMainWindow):
                         flow0 = flows_new[j]
                         if Ly0 != Ly:
                             flow0 = resize_image(flow0, Ly=Ly, Lx=Lx,
-                                                no_channels=flow0.ndim==3, 
+                                                no_channels=flow0.ndim==3,
                                                 interpolation=cv2.INTER_NEAREST)
                         if Lz0 != Lz:
                             flow0 = np.swapaxes(resize_image(np.swapaxes(flow0, 0, 1),
                                                 Ly=Lz, Lx=Lx,
-                                                no_channels=flow0.ndim==3, 
+                                                no_channels=flow0.ndim==3,
                                                 interpolation=cv2.INTER_NEAREST), 0, 1)
                         self.flows.append(flow0)
                 else:
