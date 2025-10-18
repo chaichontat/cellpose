@@ -185,7 +185,7 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
     """
     if device == None:
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('mps') if torch.backends.mps.is_available() else None
-    
+
     if train_data is not None and train_labels is not None:
         # if data is loaded
         nimg = len(train_data)
@@ -334,7 +334,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               channel_axis=None, rgb=False, normalize=True, compute_flows=False,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=True, scale_range=None, bsize=224,
-              min_train_masks=5, model_name=None):
+              min_train_masks=5, model_name=None, optimizer=None):
     """
     Train the network with images for segmentation.
 
@@ -356,7 +356,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         n_epochs (int, optional): Integer - number of times to go through the whole training set during training. Defaults to 2000.
         weight_decay (float, optional): Float - weight decay for the optimizer. Defaults to 1e-5.
         momentum (float, optional): Float - momentum for the optimizer. Defaults to 0.9.
-        SGD (bool, optional): Boolean - whether to use SGD as optimization instead of RAdam. Defaults to False.
+        SGD (bool, optional): Boolean - whether to use SGD as optimization instead of RAdam. Defaults to False. Deprecated if `optimizer` is provided.
+        optimizer (str or None, optional): Optimizer to use; one of 'adamw', 'sgd', or 'muon'. If None, falls back to AdamW unless `SGD=True`.
         channels (List[int], optional): List of ints - channels to use for training. Defaults to None.
         channel_axis (int, optional): Integer - axis of the channel dimension in the input data. Defaults to None.
         normalize (bool or dict, optional): Boolean or dictionary - whether to normalize the data. Defaults to True.
@@ -372,7 +373,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
-       
+
     """
     device = net.device
 
@@ -410,7 +411,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             "channel_axis": channel_axis,
             "rgb": rgb
         }
-    
+
     net.diam_labels.data = torch.Tensor([diam_train.mean()]).to(device)
 
     nimg = len(train_data) if train_data is not None else len(train_files)
@@ -433,18 +434,20 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
 
-    if not SGD:
-        train_logger.info(
-            f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}"
-        )
-        optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate,
-                                      weight_decay=weight_decay)
+
+    from .optimizers import create_optimizer as _create_opt
+    if optimizer is None:
+        opt_name = "sgd" if SGD else "adamw"
     else:
-        train_logger.info(
-            f">>> SGD, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}, momentum={momentum:0.3f}"
-        )
-        optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate,
-                                    weight_decay=weight_decay, momentum=momentum)
+        opt_name = str(optimizer).lower()
+        if SGD and opt_name != "sgd":
+            train_logger.warning(
+                f"Both optimizer='{opt_name}' and SGD={SGD} provided; using optimizer and ignoring SGD."
+            )
+
+    optimizer = _create_opt(
+        net.parameters(), name=opt_name, lr=learning_rate, weight_decay=weight_decay, momentum=momentum
+    )
 
     t0 = time.time()
     model_name = f"cellpose_{t0}" if model_name is None else model_name
@@ -542,7 +545,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 filename0 = filename
             train_logger.info(f"saving network parameters to {filename0}")
             net.save_model(filename0)
-    
+
     net.save_model(filename)
 
     return filename, train_losses, test_losses

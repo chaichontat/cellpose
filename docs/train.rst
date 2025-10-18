@@ -112,6 +112,8 @@ CLI training options
     --min_train_masks MIN_TRAIN_MASKS
                             minimum number of masks a training image must have to
                             be used. Default: 5
+    --optimizer {adamw,sgd,muon}
+                          optimizer to use; if not set, defaults to AdamW unless --SGD is provided (Muon requires PyTorch >= 2.9)
     --SGD SGD             use SGD
     --save_every SAVE_EVERY
                             number of epochs to skip between saves. Default: 100
