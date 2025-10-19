@@ -72,10 +72,6 @@ def get_arg_parser():
     model_args.add_argument(
         "--add_model", required=False, default=None, type=str,
         help="model path to copy model to hidden .cellpose folder for using in GUI/CLI")
-    model_args.add_argument("--pretrained_model_ortho", required=False, default=None,
-                            type=str,
-                            help="Deprecated in v4.0.1+, not used. ")
-
     # TODO: remove deprecated in future version
     model_args.add_argument("--restore_type", required=False, default=None, type=str, help=
         'Deprecated in v4.0.1+, not used. ')
@@ -122,8 +118,8 @@ def get_arg_parser():
         "--cellprob_threshold", default=0, type=float,
         help="cellprob threshold, default is 0, decrease to find more and larger masks")
     algorithm_args.add_argument(
-        "--niter", default=0, type=int, help=
-        "niter, number of iterations for dynamics for mask creation, default of 0 means it is proportional to diameter, set to a larger number like 2000 for very long ROIs"
+        "--niter", default=1000, type=int, help=
+        "niter, number of iterations for dynamics for mask creation. Default %(default)s steps; use 0 to scale automatically with diameter or increase (e.g. 2000) for very long ROIs."
     )
     algorithm_args.add_argument("--anisotropy", required=False, default=1.0, type=float,
                                 help="anisotropy of volume in 3D")

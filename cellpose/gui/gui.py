@@ -278,6 +278,9 @@ class MainW(QMainWindow):
         self.autobtn.checkStateChanged.connect(self.compute_saturation_if_checked)
 
         self.load_3D = False
+        # Fallback resample flag for legacy code paths that expect a checkbox.
+        # Some GUI configurations don't create the control, so default to True.
+        self.resample = True
 
         # if called with image, load it
         if image is not None:

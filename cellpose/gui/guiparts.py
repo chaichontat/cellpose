@@ -335,13 +335,13 @@ class SegmentationSettings(QWidget):
         # TODO: input validation
         niter_qlabel = QLabel("niter dynamics:")
         niter_qlabel.setFont(font)
-        niter_qlabel.setToolTip("number of iterations for dynamics (0 uses default based on diameter); use 2000 for bacteria")
+        niter_qlabel.setToolTip("number of iterations for dynamics (default 1000; set 0 to scale with diameter)")
         grid_layout.addWidget(niter_qlabel, row, 0, 1, 4)
         self.niter_box = QLineEdit()
-        self.niter_box.setText("0")
+        self.niter_box.setText("1000")
         self.niter_box.setFixedWidth(40)
         self.niter_box.setFont(font)
-        self.niter_box.setToolTip("number of iterations for dynamics (0 uses default based on diameter); use 2000 for bacteria")
+        self.niter_box.setToolTip("number of iterations for dynamics (default 1000; set 0 to scale with diameter)")
         grid_layout.addWidget(self.niter_box, row, 4, 1, 2)
 
         self.setLayout(grid_layout)
@@ -406,12 +406,17 @@ class SegmentationSettings(QWidget):
     
     @property
     def niter(self):
-        num = int(self.niter_box.text())
-        if num < 1:
-            self.niter_box.setText('200')
-            return 200
-        else:
+        text = self.niter_box.text()
+        try:
+            num = int(text)
+        except ValueError:
+            num = 1000
+            self.niter_box.setText(str(num))
             return num
+        if num < 0:
+            num = 0
+            self.niter_box.setText(str(num))
+        return num
 
 
 

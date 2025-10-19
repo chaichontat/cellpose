@@ -97,6 +97,11 @@ class MainW_ortho2D(MainW):
         self.dz = 10            # Number of Z planes to show above/below main plane in ortho views
         self.zaspect = 6.0      # Z-aspect ratio for ortho views
 
+        # MainW expects a resample control when handling 3D flows; default to True so
+        # downstream logic that checks self.resample works even without a checkbox.
+        if not hasattr(self, "resample"):
+            self.resample = True
+
         # --- Ortho View UI Elements (copied from gui3d.py structure) ---
         # Ortho crosshair lines
         self.vLine = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('g')) # Main view V line
@@ -115,13 +120,15 @@ class MainW_ortho2D(MainW):
         # Find the row index 'b' where the scale disk checkbox was added in make_buttons
         # This is fragile; better to add controls programmatically if layout changes.
         # Assuming 'b' from make_buttons is accessible or recalculate.
-        # Let's find the ScaleOn widget and insert before it.
+        # Let's find the ScaleOn widget and insert before it if it exists (older GUI layout).
+        scale_widget = getattr(self, "ScaleOn", None)
         scale_widget_row = -1
-        for i in range(self.l0.rowCount()):
-             item = self.l0.itemAtPosition(i, 0)
-             if item and item.widget() == self.ScaleOn:
-                  scale_widget_row = i
-                  break
+        if scale_widget is not None:
+            for i in range(self.l0.rowCount()):
+                item = self.l0.itemAtPosition(i, 0)
+                if item and item.widget() == scale_widget:
+                    scale_widget_row = i
+                    break
         b = scale_widget_row if scale_widget_row != -1 else self.l0.rowCount()
 
         # Insert ortho controls before the scale disk toggle
@@ -160,8 +167,9 @@ class MainW_ortho2D(MainW):
         self.zaspectedit.setFont(self.medfont)
         self.l0.addWidget(self.zaspectedit, ortho_row_start, 7, 1, 2)
 
-        # Shift the scale disk toggle down by one row
-        self.l0.addWidget(self.ScaleOn, ortho_row_start + 1, 0, 1, 5)
+        # Shift the scale disk toggle down by one row if present
+        if scale_widget is not None:
+            self.l0.addWidget(scale_widget, ortho_row_start + 1, 0, 1, 5)
 
         # --- Load Initial Image ---
         if image is not None:
@@ -200,16 +208,28 @@ class MainW_ortho2D(MainW):
 
         # 1. Load the main 2D image using the standard io function
         # Set load_3D=False explicitly for the base loader
+        original_load_3d_flag = self.load_3D
         try:
-            # Temporarily set load_3D flag for the call if needed by io._load_image internal logic
-            original_load_3d_flag = self.load_3D
+            # Temporarily force 2D load; guiortho manages its own ortho stack.
             self.load_3D = False
             io._load_image(self, filename=filename, load_seg=load_seg, load_3D=False)
-            self.load_3D = False # Restore flag
         except Exception as e:
             print(f"GUI_ERROR: Failed to load main image '{filename}': {e}")
             self.loaded = False
-            return # Stop if main image fails to load
+        finally:
+            self.load_3D = original_load_3d_flag
+
+        if not self.loaded and load_seg:
+            # Retry without segmentation to handle stale/missing _seg.npy files gracefully.
+            print("GUI_WARNING: Primary load failed; retrying without segmentation file.")
+            try:
+                self.load_3D = False
+                io._load_image(self, filename=filename, load_seg=False, load_3D=False)
+            except Exception as e:
+                print(f"GUI_ERROR: Fallback load failed for '{filename}': {e}")
+                self.loaded = False
+            finally:
+                self.load_3D = original_load_3d_flag
 
         if not self.loaded:
              print("GUI_ERROR: Main image loading failed (self.loaded is False).")
