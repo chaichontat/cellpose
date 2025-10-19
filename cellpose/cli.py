@@ -221,8 +221,13 @@ def get_arg_parser():
         "--min_train_masks", default=5, type=int, help=
         "minimum number of masks a training image must have to be used. Default: %(default)s"
     )
-    training_args.add_argument("--SGD", default=0, type=int,
-                               help="Deprecated in v4.0.1+, not used - AdamW used instead. ")
+    training_args.add_argument(
+        "--optimizer", default=None, type=str, choices=["adamw", "sgd", "muon"],
+        help="optimizer to use; defaults to AdamW. 'muon' requires PyTorch >= 2.9."
+    )
+    training_args.add_argument(
+        "--SGD", default=0, type=int,
+        help="Deprecated in v4.0.1+, not used - AdamW used instead. ")
     training_args.add_argument(
         "--save_every", default=100, type=int,
         help="number of epochs to skip between saves. Default: %(default)s")
