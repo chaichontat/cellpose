@@ -220,12 +220,7 @@ def get_arg_parser():
         "--min_train_masks", default=5, type=int, help=
         "minimum number of masks a training image must have to be used. Default: %(default)s"
     )
-    # Optimizer selection
-    training_args.add_argument(
-        "--optimizer", default=None, type=str, choices=["adamw", "sgd", "muon"],
-        help="optimizer to use; if not set, defaults to AdamW unless --SGD is set"
-    )
-    training_args.add_argument("--SGD", default=1, type=int, help="use SGD (deprecated if --optimizer is set)")
+    training_args.add_argument("--SGD", default=1, type=int, help="use SGD")
     training_args.add_argument(
         "--save_every", default=100, type=int,
         help="number of epochs to skip between saves. Default: %(default)s")
