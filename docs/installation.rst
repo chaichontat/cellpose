@@ -6,7 +6,7 @@ For basic install instructions, look up the main github readme.
 Built-in model directory
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-By default, the pretrained cellpose models are downloaded to ``$HOME/.cellpose/models/``.
+By default, the pretrained cellpose model(s) is downloaded to ``$HOME/.cellpose/models/``.
 This path on linux would look like ``/home/USERNAME/.cellpose/``, and on Windows, 
 ``C:/Users/USERNAME/.cellpose/models/``. These models are downloaded the first time you 
 try to use them, either on the command line, in the GUI or in a notebook.
@@ -33,7 +33,7 @@ M1-M3 Mac installation
 
 Support for M1-M3 should work out-of-the-box with Cellpose now! Please submit an issue if it's not working.
 
-From the command line you can choose the Mac device with
+From the command line you can choose the Mac device explicitly with
 
 ::
 
@@ -62,6 +62,7 @@ Common issues
 If you receive an issue with Qt "xcb", you may need to install xcb libraries, e.g.:
 
 :: 
+
    sudo apt install libxcb-cursor0
    sudo apt install libxcb-xinerama0
 
@@ -90,6 +91,7 @@ If you are having other issues with the graphical interface and QT, see some adv
 If you have errors related to OpenMP and libiomp5, then try 
 
 ::
+   
    conda install nomkl
 
 If you receive an error associated with **matplotlib**, try upgrading
@@ -111,38 +113,3 @@ to use the graphical interface for cellpose. More recent versions of Mac
 OS are fine. The software has been heavily tested on Windows 10 and
 Ubuntu 18.04, and less well tested on Mac OS. Please post an issue if
 you have installation problems.
-
-
-Dependencies
-~~~~~~~~~~~~~~~~~~~~~~
-
-cellpose relies on the following excellent packages (which are
-automatically installed with pip if missing):
-
--  `pytorch`_
--  `pyqtgraph`_
--  `PyQt5`_ or pyside or PyQt6
--  `numpy`_ (>=1.16.0)
--  `numba`_
--  `scipy`_
--  `tifffile`_
--  `natsort`_
--  `fastremap`_
--  `roifile`_
--  `superqt`_
-
-.. _Anaconda: https://www.anaconda.com/download/
-.. _environment.yml: https://github.com/MouseLand/cellpose/blob/master/environment.yml?raw=true
-.. _here: https://pypi.org/project/cellpose/
-
-.. _pytorch: https://pytorch.org/
-.. _pyqtgraph: http://pyqtgraph.org/
-.. _PyQt5: http://pyqt.sourceforge.net/Docs/PyQt5/
-.. _numpy: http://www.numpy.org/
-.. _numba: http://numba.pydata.org/numba-doc/latest/user/5minguide.html
-.. _scipy: https://www.scipy.org/
-.. _tifffile: https://pypi.org/project/tifffile/
-.. _natsort: https://natsort.readthedocs.io/en/master/
-.. _fastremap: https://github.com/seung-lab/fastremap
-.. _roifile: https://github.com/cgohlke/roifile
-.. _superqt: https://github.com/pyapp-kit/superqt

@@ -1,20 +1,19 @@
 """
-Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
+Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer , Michael Rariden and Marius Pachitariu.
 """
 import logging
 import os, tempfile, shutil, io
 from tqdm import tqdm, trange
 from urllib.request import urlopen
 import cv2
-from scipy.ndimage import find_objects, gaussian_filter, generate_binary_structure, label, maximum_filter1d, binary_fill_holes
+from scipy.ndimage import find_objects, gaussian_filter, generate_binary_structure, label
 from scipy.spatial import ConvexHull
 import numpy as np
 import colorsys
 import fastremap
 import fill_voids
 from multiprocessing import Pool, cpu_count
-
-from . import metrics
+from cellpose import metrics
 
 try:
     from skimage.morphology import remove_small_holes
@@ -642,15 +641,14 @@ def fill_holes_and_remove_small_masks(masks, min_size=15):
                          masks.ndim)
 
     # Filter small masks
-    counts = fastremap.unique(masks, return_counts=True)[1][1:]
     if min_size > 0:
+        counts = fastremap.unique(masks, return_counts=True)[1][1:]
         masks = fastremap.mask(masks, np.nonzero(counts < min_size)[0] + 1)
         fastremap.renumber(masks, in_place=True)
         
     slices = find_objects(masks)
     j = 0
-    for i in np.arange(0, len(slices)):
-        slc = slices[i]
+    for i, slc in enumerate(slices):
         if slc is not None:
             msk = masks[slc] == (i + 1)
             msk = fill_voids.fill(msk)

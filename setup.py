@@ -2,25 +2,25 @@ import setuptools
 from setuptools import setup
 
 install_deps = [
-    'numpy>=1.20.0,<2.1',
+    'numpy>=1.20.0',
     'scipy',
     'natsort',
     'tifffile',
     'tqdm',
-    'numba>=0.53.0',
-    'llvmlite',
     'torch>=1.6',
+    'torchvision',
     'opencv-python-headless',
     'fastremap',
     'imagecodecs',
     'roifile',
     'fill-voids',
+    'segment_anything'
 ]
 
 image_deps = ['nd2', 'pynrrd']
 
 gui_deps = [
-    'pyqtgraph>=0.11.0rc0', "pyqt6", "pyqt6.sip", 'qtpy', 'superqt',
+    'pyqtgraph>=0.12.4', "pyqt6", "pyqt6.sip", 'qtpy', 'superqt',
 ]
 
 docs_deps = [
@@ -57,11 +57,9 @@ except:
     pass
 
 try:
-    import PyQt5
+    import PyQt6
     gui_deps.remove("pyqt6")
     gui_deps.remove("pyqt6.sip")
-    gui_deps.append("pyqt5")
-    gui_deps.append("pyqt5.sip")
 except:
     pass
 

@@ -1,8 +1,7 @@
 """
-Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
+Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer , Michael Rariden and Marius Pachitariu.
 """
-
-import os, datetime, gc, warnings, glob, shutil
+import os, warnings, glob, shutil
 from natsort import natsorted
 import numpy as np
 import cv2
@@ -11,7 +10,7 @@ import logging, pathlib, sys
 from tqdm import tqdm
 from pathlib import Path
 import re
-from . import version_str
+from .version import version_str
 from roifile import ImagejRoi, roiwrite
 
 try:
@@ -64,11 +63,11 @@ def logger_setup(cp_path=".cellpose", logfile_name="run.log", stdout_file_replac
                     level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s",
                     handlers=handlers,
+                    force=True
     )
     logger = logging.getLogger(__name__)
     logger.info(f"WRITING LOG OUTPUT TO {log_file}")
     logger.info(version_str)
-    #logger.handlers[1].stream = sys.stdout
 
     return logger, log_file
 
@@ -218,6 +217,63 @@ def imread(filename):
             io_logger.critical("ERROR: could not read masks from file, %s" % e)
             return None
 
+
+def imread_2D(img_file):
+    """
+    Read in a 2D image file and convert it to a 3-channel image. Attempts to do this for multi-channel and grayscale images.
+    If the image has more than 3 channels, only the first 3 channels are kept.
+    
+    Args:
+        img_file (str): The path to the image file.
+
+    Returns:
+        img_out (numpy.ndarray): The 3-channel image data as a NumPy array.
+    """
+    img = imread(img_file)
+    return transforms.convert_image(img, do_3D=False)
+
+
+def imread_3D(img_file):
+    """
+    Read in a 3D image file and convert it to have a channel axis last automatically. Attempts to do this for multi-channel and grayscale images.
+
+    If multichannel image, the channel axis is assumed to be the smallest dimension, and the z axis is the next smallest dimension. 
+    Use `cellpose.io.imread()` to load the full image without selecting the z and channel axes. 
+    
+    Args:
+        img_file (str): The path to the image file.
+
+    Returns:
+        img_out (numpy.ndarray): The image data as a NumPy array.
+    """
+    img = imread(img_file)
+
+    dimension_lengths = list(img.shape)
+
+    # grayscale images:
+    if img.ndim == 3:
+        channel_axis = None
+        # guess at z axis:
+        z_axis = np.argmin(dimension_lengths)
+
+    elif img.ndim == 4:
+        # guess at channel axis:
+        channel_axis = np.argmin(dimension_lengths)
+
+        # guess at z axis: 
+        # set channel axis to max so argmin works:
+        dimension_lengths[channel_axis] = max(dimension_lengths)
+        z_axis = np.argmin(dimension_lengths)
+
+    else: 
+        raise ValueError(f'image shape error, 3D image must 3 or 4 dimensional. Number of dimensions: {img.ndim}')
+    
+    try:
+        return transforms.convert_image(img, channel_axis=channel_axis, z_axis=z_axis, do_3D=True)
+    except Exception as e:
+        io_logger.critical("ERROR: could not read file, %s" % e)
+        io_logger.critical("ERROR: Guessed z_axis: %s, channel_axis: %s" % (z_axis, channel_axis))
+        return None
 
 def remove_model(filename, delete=False):
     """ remove model from .cellpose custom model list """
@@ -384,7 +440,7 @@ def get_label_files(image_names, mask_filter, imf=None):
         label_names = [label_names[n] + mask_filter + ".tiff" for n in range(nimg)]
     elif os.path.exists(label_names[0] + mask_filter + ".png"):
         label_names = [label_names[n] + mask_filter + ".png" for n in range(nimg)]
-    # todo, allow _seg.npy
+    # TODO, allow _seg.npy
     #elif os.path.exists(label_names[0] + "_seg.npy"):
     #    io_logger.info("labels found as _seg.npy files, converting to tif")
     else:
@@ -471,7 +527,8 @@ def load_train_test_data(train_dir, test_dir=None, image_filter=None,
     return images, labels, image_names, test_images, test_labels, test_image_names
 
 
-def masks_flows_to_seg(images, masks, flows, file_names, diams=30., channels=None,
+def masks_flows_to_seg(images, masks, flows, file_names, 
+                       channels=None,
                        imgs_restore=None, restore_type=None, ratio=1.):
     """Save output of model eval to be loaded in GUI.
 
@@ -484,7 +541,7 @@ def masks_flows_to_seg(images, masks, flows, file_names, diams=30., channels=Non
         masks (list): Masks output from Cellpose.eval, where 0=NO masks; 1,2,...=mask labels.
         flows (list): Flows output from Cellpose.eval.
         file_names (list, str): Names of files of images.
-        diams (float array): Diameters used to run Cellpose. Defaults to 30.
+        diams (float array): Diameters used to run Cellpose. Defaults to 30. TODO: remove this
         channels (list, int, optional): Channels used to run Cellpose. Defaults to None.
 
     Returns:
@@ -495,19 +552,22 @@ def masks_flows_to_seg(images, masks, flows, file_names, diams=30., channels=Non
         channels = [0, 0]
 
     if isinstance(masks, list):
-        if not isinstance(diams, (list, np.ndarray)):
-            diams = diams * np.ones(len(masks), np.float32)
         if imgs_restore is None:
             imgs_restore = [None] * len(masks)
         if isinstance(file_names, str):
             file_names = [file_names] * len(masks)
-        for k, [image, mask, flow, diam, file_name, img_restore
-               ] in enumerate(zip(images, masks, flows, diams, file_names,
+        for k, [image, mask, flow, 
+                # diam, 
+                file_name, img_restore
+               ] in enumerate(zip(images, masks, flows, 
+                                #   diams, 
+                                  file_names,
                                   imgs_restore)):
             channels_img = channels
             if channels_img is not None and len(channels) > 2:
                 channels_img = channels[k]
-            masks_flows_to_seg(image, mask, flow, file_name, diams=diam,
+            masks_flows_to_seg(image, mask, flow, file_name, 
+                            #    diams=diam,
                                channels=channels_img, imgs_restore=img_restore,
                                restore_type=restore_type, ratio=ratio)
         return
@@ -560,7 +620,7 @@ def masks_flows_to_seg(images, masks, flows, file_names, diams=30., channels=Non
         "flows":
             flowi,
         "diameter":
-            diams
+            np.nan
     }
     if restore_type is not None and imgs_restore is not None:
         dat["restore"] = restore_type
@@ -751,6 +811,7 @@ def save_masks(images, masks, flows, file_names, png=True, tif=False, channels=[
     if masks.ndim < 3 and save_flows:
         check_dir(flowdir)
         imsave(os.path.join(flowdir, basename + "_flows" + suffix + ".tif"),
-               (flows[0] * (2**16 - 1)).astype(np.uint16))
+               flows[0]
+              )
         #save full flow data
         imsave(os.path.join(flowdir, basename + '_dP' + suffix + '.tif'), flows[1])

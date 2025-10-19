@@ -1,21 +1,12 @@
 """
-Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
+Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer , Michael Rariden and Marius Pachitariu.
 """
-
-import os, sys, time, shutil, tempfile, datetime, pathlib, subprocess
 import logging
 import numpy as np
-from tqdm import trange, tqdm
-from urllib.parse import urlparse
-import tempfile
-import cv2
-from scipy.stats import mode
-import fastremap
-from . import transforms, dynamics, utils, plot, metrics, resnet_torch
+from tqdm import trange
+from . import transforms, utils
 
 import torch
-from torch import nn
-from torch.utils import mkldnn as mkldnn_utils
 
 TORCH_ENABLED = True
 
@@ -118,29 +109,7 @@ def assign_device(use_torch=True, gpu=False, device=0):
     return device, gpu
 
 
-def check_mkl(use_torch=True):
-    """
-    Checks if MKL-DNN is enabled and working.
-
-    Args:
-        use_torch (bool, optional): Whether to use torch. Defaults to True.
-
-    Returns:
-        bool: True if MKL-DNN is enabled, False otherwise.
-    """
-    mkl_enabled = torch.backends.mkldnn.is_available()
-    if mkl_enabled:
-        mkl_enabled = True
-    else:
-        core_logger.info(
-            "WARNING: MKL version on torch not working/installed - CPU version will be slightly slower."
-        )
-        core_logger.info(
-            "see https://pytorch.org/docs/stable/backends.html?highlight=mkl")
-    return mkl_enabled
-
-
-def _to_device(x, device):
+def _to_device(x, device, dtype=torch.float32):
     """
     Converts the input tensor or numpy array to the specified device.
 
@@ -152,7 +121,7 @@ def _to_device(x, device):
         torch.Tensor: The converted tensor on the specified device.
     """
     if not isinstance(x, torch.Tensor):
-        X = torch.from_numpy(x).to(device, dtype=torch.float32)
+        X = torch.from_numpy(x).to(device, dtype=dtype)
         return X
     else:
         return x
@@ -168,7 +137,8 @@ def _from_device(X):
     Returns:
         numpy.ndarray: The converted NumPy array.
     """
-    x = X.detach().cpu().numpy()
+    # The cast is so numpy conversion always works
+    x = X.detach().cpu().to(torch.float32).numpy()
     return x
 
 
@@ -182,10 +152,8 @@ def _forward(net, x):
     Returns:
         Tuple[numpy.ndarray, numpy.ndarray]: The output predictions (flows and cellprob) and style features.
     """
-    X = _to_device(x, net.device)
+    X = _to_device(x, device=net.device, dtype=net.dtype)
     net.eval()
-    if net.mkldnn:
-        net = mkldnn_utils.to_mkldnn(net)
     with torch.no_grad():
         y, style = net(X)[:2]
     del X
@@ -216,7 +184,6 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             style is a 1D array of size 256 summarizing the style of the image, if tiled `style` is averaged over tiles.
     """
     # run network
-    nout = net.nout
     Lz, Ly0, Lx0, nchan = imgi.shape 
     if rsz is not None:
         if not isinstance(rsz, list) and not isinstance(rsz, np.ndarray):
@@ -224,19 +191,19 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         Lyr, Lxr = int(Ly0 * rsz[0]), int(Lx0 * rsz[1])
     else:
         Lyr, Lxr = Ly0, Lx0
-    ypad1, ypad2, xpad1, xpad2 = transforms.get_pad_yx(Lyr, Lxr)
-    pads = np.array([[0, 0], [ypad1, ypad2], [xpad1, xpad2]])
+    
+    ly, lx = bsize, bsize
+    ypad1, ypad2, xpad1, xpad2 = transforms.get_pad_yx(Lyr, Lxr, min_size=(bsize, bsize))
     Ly, Lx = Lyr + ypad1 + ypad2, Lxr + xpad1 + xpad2
+    pads = np.array([[0, 0], [ypad1, ypad2], [xpad1, xpad2]])
+    
     if augment:
         ny = max(2, int(np.ceil(2. * Ly / bsize)))
         nx = max(2, int(np.ceil(2. * Lx / bsize)))
-        ly, lx = bsize, bsize
     else:
         ny = 1 if Ly <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Ly / bsize))
         nx = 1 if Lx <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Lx / bsize))
-        ly, lx = min(bsize, Ly), min(bsize, Lx)
-    yf = np.zeros((Lz, nout, Ly, Lx), "float32")
-    styles = np.zeros((Lz, 256), "float32")
+    
     
     # run multiple slices at the same time
     ntiles = ny * nx
@@ -251,28 +218,38 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             # pad image for net so Ly and Lx are divisible by 4
             imgb = transforms.resize_image(imgi[b], rsz=rsz) if rsz is not None else imgi[b].copy()
             imgb = np.pad(imgb.transpose(2,0,1), pads, mode="constant")
-            IMG, ysub, xsub, Ly, Lx = transforms.make_tiles(
+            IMG, ysub, xsub, Lyt, Lxt = transforms.make_tiles(
                 imgb, bsize=bsize, augment=augment,
                 tile_overlap=tile_overlap)
             IMGa[i * ntiles : (i+1) * ntiles] = np.reshape(IMG, 
                                             (ny * nx, nchan, ly, lx))
         
-        ya = np.zeros((IMGa.shape[0], nout, ly, lx), "float32")
-        stylea = np.zeros((IMGa.shape[0], 256), "float32")
+        # run network
         for j in range(0, IMGa.shape[0], batch_size):
             bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
-            ya[bslc], stylea[bslc] = _forward(net, IMGa[bslc])
+            ya0, stylea0 = _forward(net, IMGa[bslc])
+            if j == 0:
+                nout = ya0.shape[1]
+                ya = np.zeros((IMGa.shape[0], nout, ly, lx), "float32")
+                stylea = np.zeros((IMGa.shape[0], 256), "float32")
+            ya[bslc] = ya0
+            stylea[bslc] = stylea0
+
+        # average tiles
         for i, b in enumerate(inds):
+            if i==0 and k==0:
+                yf = np.zeros((Lz, nout, Ly, Lx), "float32")
+                styles = np.zeros((Lz, 256), "float32")
             y = ya[i * ntiles : (i + 1) * ntiles]
             if augment:
                 y = np.reshape(y, (ny, nx, 3, ly, lx))
                 y = transforms.unaugment_tiles(y)
                 y = np.reshape(y, (-1, 3, ly, lx))
-            yfi = transforms.average_tiles(y, ysub, xsub, Ly, Lx)
+            yfi = transforms.average_tiles(y, ysub, xsub, Lyt, Lxt)
             yf[b] = yfi[:, :imgb.shape[-2], :imgb.shape[-1]]
-            stylei = stylea[i * ntiles:(i + 1) * ntiles].sum(axis=0)
-            stylei /= (stylei**2).sum()**0.5
-            styles[b] = stylei
+            # stylei = stylea[i * ntiles:(i + 1) * ntiles].sum(axis=0)
+            # stylei /= (stylei**2).sum()**0.5
+            # styles[b] = stylei
     # slices from padding
     yf = yf[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
     yf = yf.transpose(0,2,3,1)   
@@ -309,14 +286,13 @@ def run_3D(net, imgs, batch_size=8, augment=False,
     cp = [(1, 2), (0, 2), (0, 1)]
     cpy = [(0, 1), (0, 1), (0, 1)]
     shape = imgs.shape[:-1]
-    #cellprob = np.zeros(shape, "float32")
     yf = np.zeros((*shape, 4), "float32")
     for p in range(3):
         xsl = imgs.transpose(pm[p])
         # per image
         core_logger.info("running %s: %d planes of size (%d, %d)" %
                          (sstr[p], shape[pm[p][0]], shape[pm[p][1]], shape[pm[p][2]]))
-        y, style = run_net(net if p==0 or net_ortho is None else net_ortho, 
+        y, style = run_net(net,
                            xsl, batch_size=batch_size, augment=augment, 
                            bsize=bsize, tile_overlap=tile_overlap, 
                            rsz=None)

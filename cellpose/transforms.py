@@ -1,9 +1,7 @@
 """
-Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
+Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer , Michael Rariden and Marius Pachitariu.
 """
-
 import logging
-import warnings
 
 import cv2
 import numpy as np
@@ -432,7 +430,7 @@ def update_axis(m_axis, to_squeeze, ndim):
         ndim (int): The number of dimensions.
 
     Returns:
-        int or None: The updated axis value.
+        m_axis (int or None): The updated axis value.
     """
     if m_axis == -1:
         m_axis = ndim - 1
@@ -449,168 +447,199 @@ def update_axis(m_axis, to_squeeze, ndim):
     return m_axis
 
 
-def convert_image(x, channels, channel_axis=None, z_axis=None, do_3D=False, nchan=2):
-    """Converts the image to have the z-axis first, channels last.
+def _convert_image_3d(x, channel_axis=None, z_axis=None):
+    """
+    Convert a 3D or 4D image array to have dimensions ordered as (Z, X, Y, C).
+
+    Arrays of ndim=3 are assumed to be grayscale and must be specified with z_axis. 
+    Arrays of ndim=4 must have both `channel_axis` and `z_axis` specified.
+    
+    Args:
+        x (numpy.ndarray): Input image array. Must be either 3D (assumed to be grayscale 3D) or 4D. 
+        channel_axis (int): The axis index corresponding to the channel dimension in the input array. \
+            Must be specified for 4D images.
+        z_axis (int): The axis index corresponding to the depth (Z) dimension in the input array. \
+            Must be specified for both 3D and 4D images.
+
+    Returns:
+        numpy.ndarray: A 4D image array with dimensions ordered as (Z, X, Y, C), where C is the channel 
+        dimension. If the input has fewer than 3 channels, the output will be padded with zeros to \
+            have 3 channels. If the input has more than 3 channels, only the first 3 channels will be retained.
+    
+    Raises:
+        ValueError: If `z_axis` is not specified for 3D images. If either `channel_axis` or `z_axis` \
+            is not specified for 4D images. If the input image does not have 3 or 4 dimensions.
+
+    Notes:
+        - For 3D images (ndim=3), the function assumes the input is grayscale and adds a singleton channel dimension.
+        - The function reorders the dimensions of the input array to ensure the output has the desired (Z, X, Y, C) order.
+        - If the number of channels is not equal to 3, the function either truncates or pads the \
+            channels to ensure the output has exactly 3 channels.
+    """
+
+    if x.ndim < 3:
+        raise ValueError(f"Input image must have at least 3 dimensions, input shape: {x.shape}, ndim={x.ndim}")
+    
+    if z_axis is not None and z_axis < 0:
+        z_axis += x.ndim
+
+    # if image is ndim==3, assume it is greyscale 3D and use provided z_axis
+    if x.ndim == 3 and z_axis is not None:
+        # add in channel axis
+        x = x[..., np.newaxis]
+        channel_axis = 3
+    elif x.ndim == 3 and z_axis is None:
+        raise ValueError("z_axis must be specified when segmenting 3D images of ndim=3")
+
+
+    if channel_axis is None or z_axis is None:
+        raise ValueError("For 4D images, both `channel_axis` and `z_axis` must be explicitly specified. Please provide values for both parameters.")
+    if channel_axis is not None and channel_axis < 0:
+        channel_axis += x.ndim
+    if channel_axis is None or channel_axis >= x.ndim:
+        raise IndexError(f"channel_axis {channel_axis} is out of bounds for input array with {x.ndim} dimensions")
+    assert x.ndim == 4, f"input image must have ndim == 4, ndim={x.ndim}"
+    
+    x_dim_shapes = list(x.shape)
+    num_z_layers = x_dim_shapes[z_axis]
+    num_channels = x_dim_shapes[channel_axis]
+    x_xy_axes = [i for i in range(x.ndim)]
+    
+    # need to remove the z and channels from the shapes:
+    # delete the one with the bigger index first 
+    if z_axis > channel_axis:
+        del x_dim_shapes[z_axis]
+        del x_dim_shapes[channel_axis]
+
+        del x_xy_axes[z_axis]
+        del x_xy_axes[channel_axis]
+
+    else: 
+        del x_dim_shapes[channel_axis]
+        del x_dim_shapes[z_axis]
+
+        del x_xy_axes[channel_axis]
+        del x_xy_axes[z_axis]
+
+    x = x.transpose((z_axis, x_xy_axes[0], x_xy_axes[1], channel_axis))
+
+    # Handle cases with not 3 channels:
+    if num_channels != 3:
+        x_chans_to_copy = min(3, num_channels)
+
+        if num_channels > 3:
+            transforms_logger.warning("more than 3 channels provided, only segmenting on first 3 channels")
+            x = x[..., :x_chans_to_copy]
+        else: 
+            # less than 3 channels: pad up to 
+            pad_width = [(0, 0), (0, 0), (0, 0), (0, 3 - x_chans_to_copy)]
+            x = np.pad(x, pad_width, mode='constant', constant_values=0)
+
+    return x
+
+
+def convert_image(x, channel_axis=None, z_axis=None, do_3D=False):
+    """Converts the image to have the z-axis first, channels last. Image will be converted to 3 channels if it is not already.
+    If more than 3 channels are provided, only the first 3 channels will be used. 
+
+    Accepts: 
+        - 2D images with no channel dimension: `z_axis` and `channel_axis` must be `None`
+        - 2D images with channel dimension: `channel_axis` will be guessed between first or last axis, can also specify `channel_axis`. `z_axis` must be `None`
+        - 3D images with or without channels: 
 
     Args:
         x (numpy.ndarray or torch.Tensor): The input image.
-        channels (list or None): The list of channels to use (ones-based, 0=gray). If None, all channels are kept.
         channel_axis (int or None): The axis of the channels in the input image. If None, the axis is determined automatically.
         z_axis (int or None): The axis of the z-dimension in the input image. If None, the axis is determined automatically.
         do_3D (bool): Whether to process the image in 3D mode. Defaults to False.
-        nchan (int): The number of channels to keep if the input image has more than nchan channels.
 
     Returns:
         numpy.ndarray: The converted image.
 
     Raises:
-        ValueError: If the input image has less than two channels and channels are not specified.
         ValueError: If the input image is 2D and do_3D is True.
         ValueError: If the input image is 4D and do_3D is False.
     """
-    # check if image is a torch array instead of numpy array
-    # converts torch to numpy
+
+    # check if image is a torch array instead of numpy array, convert to numpy
     ndim = x.ndim
     if torch.is_tensor(x):
         transforms_logger.warning("torch array used as input, converting to numpy")
         x = x.cpu().numpy()
 
-    # squeeze image, and if channel_axis or z_axis given, transpose image
-    if x.ndim > 3:
-        to_squeeze = np.array([int(isq) for isq, s in enumerate(x.shape) if s == 1])
-        # remove channel axis if number of channels is 1
-        if len(to_squeeze) > 0:
-            channel_axis = update_axis(
-                channel_axis, to_squeeze,
-                x.ndim) if channel_axis is not None else None
-            z_axis = update_axis(z_axis, to_squeeze,
-                                 x.ndim) if z_axis is not None else None
-            x = x.squeeze()
+    # should be 2D
+    if z_axis is not None and not do_3D:
+        raise ValueError("2D image provided, but z_axis is not None. Set z_axis=None to process 2D images of ndim=2 or 3.")
 
-    # put z axis first
-    if z_axis is not None and x.ndim > 2 and z_axis != 0:
-        x = move_axis(x, m_axis=z_axis, first=True)
-        if channel_axis is not None:
-            channel_axis += 1
-        z_axis = 0
-    elif z_axis is None and x.ndim > 2 and channels is not None and min(x.shape) > 5 :
-        # if there are > 5 channels and channels!=None, assume first dimension is z
-        min_dim = min(x.shape)
-        if min_dim != channel_axis:
-            z_axis = (x.shape).index(min_dim)
-            if z_axis != 0:
-                x = move_axis(x, m_axis=z_axis, first=True)
-                if channel_axis is not None:
-                    channel_axis += 1
-            transforms_logger.warning(f"z_axis not specified, assuming it is dim {z_axis}")
-            transforms_logger.warning(f"if this is actually the channel_axis, use 'model.eval(channel_axis={z_axis}, ...)'")
-            z_axis = 0
+    # make sure that channel_axis and z_axis are specified if 3D
+    if ndim == 4 and not do_3D:
+        raise ValueError("3D input image provided, but do_3D is False. Set do_3D=True to process 3D images. ndims=4")
 
-    if z_axis is not None:
-        if x.ndim == 3:
-            x = x[..., np.newaxis]
-
-    # put channel axis last
-    if channel_axis is not None and x.ndim > 2:
-        x = move_axis(x, m_axis=channel_axis, first=False)
-    elif x.ndim == 2:
-        x = x[:, :, np.newaxis]
-
+    # make sure that channel_axis and z_axis are specified if 3D
     if do_3D:
-        if ndim < 3:
-            transforms_logger.critical("ERROR: cannot process 2D images in 3D mode")
-            raise ValueError("ERROR: cannot process 2D images in 3D mode")
-        elif x.ndim < 4:
-            x = x[..., np.newaxis]
+        return _convert_image_3d(x, channel_axis=channel_axis, z_axis=z_axis)
+    
+    ######################## 2D reshaping ########################
+    # if user specifies channel axis, return early
+    if channel_axis is not None:
+        if ndim == 2:
+            raise ValueError("2D image provided, but channel_axis is not None. Set channel_axis=None to process 2D images of ndim=2.")
+        
+        # Put channel axis last:
+        # Find the indices of the dims that need to be put in dim 0 and 1
+        n_channels = x.shape[channel_axis]
+        x_shape_dims = list(x.shape)
+        del x_shape_dims[channel_axis]
+        dimension_indicies = [i for i in range(x.ndim)]
+        del dimension_indicies[channel_axis]
 
-    if channel_axis is None:
-        x = move_min_dim(x)
+        x = x.transpose((dimension_indicies[0], dimension_indicies[1], channel_axis))
 
-    if x.ndim > 3:
-        transforms_logger.info(
-            "multi-stack tiff read in as having %d planes %d channels" %
-            (x.shape[0], x.shape[-1]))
+        if n_channels != 3:
+            x_chans_to_copy = min(3, n_channels)
 
-    # convert to float32
-    x = x.astype("float32")
+            if n_channels > 3: 
+                transforms_logger.warning("more than 3 channels provided, only segmenting on first 3 channels")
+                x = x[..., :x_chans_to_copy]
+            else: 
+                x_out = np.zeros((x_shape_dims[0], x_shape_dims[1], 3), dtype=x.dtype)
+                x_out[..., :x_chans_to_copy] = x[...]
+                x = x_out
+                del x_out
 
-    if channels is not None:
-        channels = channels[0] if len(channels) == 1 else channels
-        if len(channels) < 2:
-            transforms_logger.critical("ERROR: two channels not specified")
-            raise ValueError("ERROR: two channels not specified")
-        x = reshape(x, channels=channels)
+        return x
 
+    # do image padding and channel conversion
+    if ndim == 2:
+        # grayscale image, make 3 channels
+        x_out = np.zeros((x.shape[0], x.shape[1], 3), dtype=x.dtype)
+        x_out[..., 0] = x
+        x = x_out
+        del x_out
+    elif ndim == 3:
+        # assume 2d with channels
+        # find dim with smaller size between first and last dims
+        move_channel_axis = x.shape[0] < x.shape[2]
+        if move_channel_axis:
+            x = x.transpose((1, 2, 0))
+
+        # zero padding up to 3 channels: 
+        num_channels = x.shape[-1]
+        if num_channels > 3: 
+            transforms_logger.warning("Found more than 3 channels, only using first 3")
+            num_channels = 3
+        x_out = np.zeros((x.shape[0], x.shape[1], 3), dtype=x.dtype)
+        x_out[..., :num_channels] = x[..., :num_channels]
+        x = x_out
+        del x_out
     else:
-        # code above put channels last
-        if nchan is not None and x.shape[-1] > nchan:
-            transforms_logger.warning(
-                "WARNING: more than %d channels given, use 'channels' input for specifying channels - just using first %d channels to run processing"
-                % (nchan, nchan))
-            x = x[..., :nchan]
-
-        # if not do_3D and x.ndim > 3:
-        #    transforms_logger.critical("ERROR: cannot process 4D images in 2D mode")
-        #    raise ValueError("ERROR: cannot process 4D images in 2D mode")
-
-        if nchan is not None and x.shape[-1] < nchan:
-            x = np.concatenate((x, np.tile(np.zeros_like(x), (1, 1, nchan - 1))),
-                               axis=-1)
+        # something is wrong: yell
+        expected_shapes = "2D (H, W), 3D (H, W, C), or 4D (Z, H, W, C)"
+        transforms_logger.critical(f"ERROR: Unexpected image shape: {str(x.shape)}. Expected shapes: {expected_shapes}")
+        raise ValueError(f"ERROR: Unexpected image shape: {str(x.shape)}. Expected shapes: {expected_shapes}")
 
     return x
-
-
-def reshape(data, channels=[0, 0], chan_first=False):
-    """Reshape data using channels.
-
-    Args:
-        data (numpy.ndarray): The input data. It should have shape (Z x ) Ly x Lx x nchan
-            if data.ndim==3 and data.shape[0]<8, it is assumed to be nchan x Ly x Lx.
-        channels (list of int, optional): The channels to use for reshaping. The first element
-            of the list is the channel to segment (0=grayscale, 1=red, 2=green, 3=blue). The
-            second element of the list is the optional nuclear channel (0=none, 1=red, 2=green, 3=blue).
-            For instance, to train on grayscale images, input [0,0]. To train on images with cells
-            in green and nuclei in blue, input [2,3]. Defaults to [0, 0].
-        chan_first (bool, optional): Whether to return the reshaped data with channel as the first
-            dimension. Defaults to False.
-
-    Returns:
-        numpy.ndarray: The reshaped data with shape (Z x ) Ly x Lx x nchan (if chan_first==False).
-    """
-    if data.ndim < 3:
-        data = data[:, :, np.newaxis]
-    elif data.shape[0] < 8 and data.ndim == 3:
-        data = np.transpose(data, (1, 2, 0))
-
-    # use grayscale image
-    if data.shape[-1] == 1:
-        data = np.concatenate((data, np.zeros(data.shape, "float32")), axis=-1)
-    else:
-        if channels[0] == 0:
-            data = data.mean(axis=-1, keepdims=True)
-            data = np.concatenate((data, np.zeros(data.shape, "float32")), axis=-1)
-        else:
-            chanid = [channels[0] - 1]
-            if channels[1] > 0:
-                chanid.append(channels[1] - 1)
-            data = data[..., chanid]
-            for i in range(data.shape[-1]):
-                if np.ptp(data[..., i]) == 0.0:
-                    if i == 0:
-                        warnings.warn("'chan to seg' to seg has value range of ZERO")
-                    else:
-                        warnings.warn(
-                            "'chan2 (opt)' has value range of ZERO, can instead set chan2 to 0"
-                        )
-            if data.shape[-1] == 1:
-                data = np.concatenate((data, np.zeros(data.shape, "float32")), axis=-1)
-    if chan_first:
-        if data.ndim == 4:
-            data = np.transpose(data, (3, 0, 1, 2))
-        else:
-            data = np.transpose(data, (2, 0, 1))
-    return data
-
+    
 
 def normalize_img(img, normalize=True, norm3D=True, invert=False, lowhigh=None,
                   percentile=(1., 99.), sharpen_radius=0, smooth_radius=0,
@@ -701,6 +730,7 @@ def normalize_img(img, normalize=True, norm3D=True, invert=False, lowhigh=None,
                 smooth3D=tile_norm_smooth3D,
                 norm3D=norm3D,
             )
+            cgood[:] = True
         elif normalize:
             if img_norm.ndim == 3 or norm3D:  # i.e. if YXC, or ZYXC with norm3D=True
                 for c in range(nchan):
@@ -738,6 +768,14 @@ def normalize_img(img, normalize=True, norm3D=True, invert=False, lowhigh=None,
     # Move channel axis back to the original position
     if axis != -1 and axis != img_norm.ndim - 1:
         img_norm = np.moveaxis(img_norm, -1, axis)
+
+    # The transformer can get confused if a channel is all 1's instead of all 0's:
+    for i, chan_did_normalize in enumerate(cgood):
+        if not chan_did_normalize:
+            if img_norm.ndim == 3:
+                img_norm[:, :, i] = 0
+            if img_norm.ndim == 4:
+                img_norm[:, :, :, i] = 0
 
     return img_norm
 
@@ -836,13 +874,13 @@ def get_pad_yx(Ly, Lx, div=16, extra=1, min_size=None):
     if min_size is None or Ly >= min_size[-2]:
         Lpad = int(div * np.ceil(Ly / div) - Ly)
     else:
-        Lpad = min_size[-2] - Ly
+        Lpad = max(0, min_size[-2] - Ly - (extra * div))
     ypad1 = extra * div // 2 + Lpad // 2
     ypad2 = extra * div // 2 + Lpad - Lpad // 2
     if min_size is None or Lx >= min_size[-1]:
         Lpad = int(div * np.ceil(Lx / div) - Lx)
     else:
-        Lpad = min_size[-1] - Lx
+        Lpad = max(0, min_size[-1] - Lx - (extra * div))
     xpad1 = extra * div // 2 + Lpad // 2
     xpad2 = extra * div // 2 + Lpad - Lpad // 2
 
@@ -912,7 +950,7 @@ def random_rotate_and_resize(X, Y=None, scale_range=1., xy=(224, 224), do_3D=Fal
         lbl (ND-array, float): Transformed labels in array [nimg x nchan x xy[0] x xy[1]]; 
         scale (array, float): Amount each image was resized by.
     """
-    scale_range = max(0, min(2, float(scale_range)))
+    scale_range = max(0, min(2, float(scale_range))) if scale_range is not None else scale_range
     nimg = len(X)
     if X[0].ndim > 2:
         nchan = X[0].shape[0]
@@ -941,7 +979,10 @@ def random_rotate_and_resize(X, Y=None, scale_range=1., xy=(224, 224), do_3D=Fal
             # generate random augmentation parameters
             flip = np.random.rand() > .5
             theta = np.random.rand() * np.pi * 2 if rotate else 0.
-            scale[n] =  (1 - scale_range / 2) + scale_range * np.random.rand()
+            if scale_range is None:
+                scale[n] = 2 ** (4 * np.random.rand() - 2)
+            else:
+                scale[n] =  (1 - scale_range / 2) + scale_range * np.random.rand()
             if rescale is not None:
                 scale[n] *= 1. / rescale[n]
             dxy = np.maximum(0, np.array([Lx * scale[n] - xy[1],
@@ -1009,7 +1050,7 @@ def random_rotate_and_resize(X, Y=None, scale_range=1., xy=(224, 224), do_3D=Fal
 
         if Y is not None:
             for k in range(nt):
-                flag = cv2.INTER_NEAREST if k == 0 else cv2.INTER_LINEAR
+                flag = cv2.INTER_NEAREST if k < nt-2 else cv2.INTER_LINEAR
                 if do_3D:
                     lbl0 = np.zeros((lz, xy[0], xy[1]), "float32")
                     for z in range(lz):
