@@ -871,6 +871,51 @@ class MainW(QMainWindow):
     def undo_remove_action(self):
         self.undo_remove_cell()
 
+    def _capture_display_state(self):
+        """Store UI state required to restore channel display after image loads."""
+        combo = getattr(self, "RGBDropDown", None)
+        rgb_index = combo.currentIndex() if combo is not None else None
+        return {
+            "color": getattr(self, "color", None),
+            "rgb_index": rgb_index,
+        }
+
+    def _restore_display_state(self, state):
+        if not state:
+            return
+
+        combo = getattr(self, "RGBDropDown", None)
+        if combo is None:
+            return
+
+        color = state.get("color") if isinstance(state, dict) else None
+        rgb_index = state.get("rgb_index") if isinstance(state, dict) else None
+        if rgb_index is None and color is None:
+            return
+
+        if rgb_index is None:
+            rgb_index = color if color is not None else combo.currentIndex()
+
+        count = combo.count() if hasattr(combo, "count") else None
+        if count is not None and count > 0:
+            max_index = count - 1
+            rgb_index = max(0, min(max_index, rgb_index))
+            if color is not None:
+                color = max(0, min(max_index, color))
+
+        self.color = color if color is not None else rgb_index
+
+        blocker = getattr(combo, "blockSignals", None)
+        should_unblock = False
+        if callable(blocker):
+            blocker(True)
+            should_unblock = True
+        try:
+            combo.setCurrentIndex(rgb_index)
+        finally:
+            if should_unblock:
+                blocker(False)
+
     def get_files(self):
         folder = os.path.dirname(self.filename)
         mask_filter = "_masks"
@@ -885,6 +930,7 @@ class MainW(QMainWindow):
         current_view_rect = self.p0.viewRect()
         current_saturation = copy.deepcopy(self.saturation)
         current_z_index = self.currentZ
+        display_state = self._capture_display_state()
 
         images, idx = self.get_files()
         idx = (idx - 1) % len(images)
@@ -908,10 +954,12 @@ class MainW(QMainWindow):
                  if r_idx < len(self.saturation) and self.currentZ < len(self.saturation[r_idx]):
                      self.sliders[r_idx].setValue(self.saturation[r_idx][self.currentZ])
 
+            self._restore_display_state(display_state)
             # Refresh the plot
             self.update_plot()
         except Exception as e:
             print(f"GUI_ERROR: Could not restore view state: {e}")
+            self._restore_display_state(display_state)
 
 
     def get_next_image(self, load_seg=True):
@@ -919,6 +967,7 @@ class MainW(QMainWindow):
         current_view_rect = self.p0.viewRect()
         current_saturation = copy.deepcopy(self.saturation)
         current_z_index = self.currentZ
+        display_state = self._capture_display_state()
 
         images, idx = self.get_files()
         idx = (idx + 1) % len(images)
@@ -944,9 +993,11 @@ class MainW(QMainWindow):
                  if r_idx < len(self.saturation) and self.currentZ < len(self.saturation[r_idx]):
                      self.sliders[r_idx].setValue(self.saturation[r_idx][self.currentZ])
 
+            self._restore_display_state(display_state)
             self.update_plot()
         except Exception as e:
             print(f"GUI_ERROR: Could not restore view state: {e}")
+            self._restore_display_state(display_state)
 
 
     def dragEnterEvent(self, event):
