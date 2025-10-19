@@ -588,6 +588,13 @@ class ViewBoxNoRightDrag(pg.ViewBox):
         self.parent = parent
         self.axHistoryPointer = -1
 
+    def mouseDragEvent(self, ev, axis=None):
+        """Prevent right-button drags from triggering the default zoom behaviour."""
+        if ev.button() == QtCore.Qt.RightButton or ev.buttons() & QtCore.Qt.RightButton:
+            ev.accept()
+            return
+        super().mouseDragEvent(ev, axis=axis)
+
     def keyPressEvent(self, ev):
         """
         This routine should capture key presses in the current view box.
