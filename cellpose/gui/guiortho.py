@@ -172,11 +172,22 @@ class MainW_ortho2D(MainW):
 
     def dropEvent(self, event):
         files = [u.toLocalFile() for u in event.mimeData().urls()]
-        if os.path.splitext(files[0])[-1] == ".npy":
-            io._load_seg(self, filename=files[0], load_3D=self.load_3D)
-        else:
-            print(files)
-            self._load_image_ortho2D(filename=files[0], load_seg=True)
+        if not files:
+            return
+        ext = os.path.splitext(files[0])[1].lower()
+        if ext == ".npy":
+            msg = (
+                "Ortho viewer does not accept .npy segmentation files. "
+                "Use the standard GUI to load segmentations, or drop an image file."
+            )
+            print(f"GUI_ERROR: {msg}")
+            try:
+                QMessageBox.critical(self, "Unsupported file", msg)
+            except Exception:
+                pass
+            return
+        print(files)
+        self._load_image_ortho2D(filename=files[0], load_seg=True)
 
     def _load_image(self, filename=None, load_seg=True):
         """ Override base _load_image to call the ortho version. """
@@ -474,6 +485,12 @@ class MainW_ortho2D(MainW):
         if self.stack_ortho is None or self.ortho_nz == 0:
             return
 
+        # Snapshot main view range to prevent inadvertent zoom/pan changes
+        try:
+            p0_xr, p0_yr = self.p0.viewRange()
+        except Exception:
+            p0_xr, p0_yr = None, None
+
         # Parse inputs defensively
         try:
             requested_dz = int(self.dzedit.text())
@@ -529,8 +546,18 @@ class MainW_ortho2D(MainW):
             # Build orthoview images using current window (pad implicitly by bounds checks)
             C = self.stack_ortho.shape[-1]
             dtype = self.stack_ortho.dtype
-            yz_img = np.zeros((self.Ly, zrange, C), dtype=dtype)
-            xz_img = np.zeros((zrange, self.Lx, C), dtype=dtype)
+            Ly_target, Lx_target = int(self.Ly), int(self.Lx)
+            yz_img = np.zeros((Ly_target, zrange, C), dtype=dtype)
+            xz_img = np.zeros((zrange, Lx_target, C), dtype=dtype)
+
+            # Prepare resampling indices if needed (to match main view dims)
+            sy, sx = int(self.stack_ortho.shape[1]), int(self.stack_ortho.shape[2])
+            idx_y = None
+            idx_x = None
+            if sy != Ly_target:
+                idx_y = np.clip(np.round(np.linspace(0, sy - 1, Ly_target)).astype(int), 0, sy - 1)
+            if sx != Lx_target:
+                idx_x = np.clip(np.round(np.linspace(0, sx - 1, Lx_target)).astype(int), 0, sx - 1)
 
             # Determine valid local range to copy
             local_from = max(0, -zi_start)
@@ -538,42 +565,56 @@ class MainW_ortho2D(MainW):
             for k in range(local_from, local_to_excl):
                 z_abs = zi_start + k
                 if 0 <= z_abs < self.ortho_nz:
-                    yz_img[:, k, :] = self.stack_ortho[z_abs, :, x]
-                    xz_img[k, :, :] = self.stack_ortho[z_abs, y, :]
+                    col = self.stack_ortho[z_abs, :, x, :]
+                    row = self.stack_ortho[z_abs, y, :, :]
+                    if idx_y is not None:
+                        col = col[idx_y, :]
+                    if idx_x is not None:
+                        row = row[idx_x, :]
+                    yz_img[:, k, :] = col
+                    xz_img[k, :, :] = row
+
+            # Compute levels to exactly mirror main view
+            levels_main = None
+            lut_main = None
+            image_mode = self.color
+            if image_mode == 0:
+                if self.nchan > 1:
+                    levels_main = np.array([
+                        self.saturation[0][self.currentZ],
+                        self.saturation[1][self.currentZ],
+                        self.saturation[2][self.currentZ],
+                    ])
+                else:
+                    levels_main = self.saturation[0][self.currentZ]
+                lut_main = None
+            elif 0 < image_mode < 4:
+                levels_main = self.saturation[(self.color - 1) if self.nchan > 1 else 0][self.currentZ]
+                lut_main = self.cmap[self.color]
+            elif image_mode == 4:
+                levels_main = self.saturation[0][self.currentZ]
+                lut_main = None
+            elif image_mode == 5:
+                levels_main = self.saturation[0][self.currentZ]
+                lut_main = self.cmap[0]
 
             for j in range(2):
                 image = yz_img if j == 0 else xz_img
                 if self.nchan == 1:
                     image = image[..., 0]
-                if self.color == 0:
-                    self.imgOrtho[j].setImage(image, autoLevels=False, lut=None)
-                    if self.nchan > 1:
-                        levels = np.array([
-                            self.saturation[0][self.currentZ],
-                            self.saturation[1][self.currentZ],
-                            self.saturation[2][self.currentZ]
-                        ])
-                        self.imgOrtho[j].setLevels(levels)
-                    else:
-                        self.imgOrtho[j].setLevels(self.saturation[0][self.currentZ])
-                elif self.color > 0 and self.color < 4:
+                if image_mode == 0:
+                    self.imgOrtho[j].setImage(image, autoLevels=False, lut=lut_main)
+                elif 0 < image_mode < 4:
                     if self.nchan > 1:
                         image = image[..., self.color - 1]
-                    self.imgOrtho[j].setImage(image, autoLevels=False, lut=self.cmap[self.color])
-                    if self.nchan > 1:
-                        self.imgOrtho[j].setLevels(self.saturation[self.color - 1][self.currentZ])
-                    else:
-                        self.imgOrtho[j].setLevels(self.saturation[0][self.currentZ])
-                elif self.color == 4:
+                    self.imgOrtho[j].setImage(image, autoLevels=False, lut=lut_main)
+                elif image_mode in (4, 5):
                     if image.ndim > 2:
                         image = image.astype("float32").mean(axis=2).astype("uint8")
-                    self.imgOrtho[j].setImage(image, autoLevels=False, lut=None)
-                    self.imgOrtho[j].setLevels(self.saturation[0][self.currentZ])
-                elif self.color == 5:
-                    if image.ndim > 2:
-                        image = image.astype("float32").mean(axis=2).astype("uint8")
-                    self.imgOrtho[j].setImage(image, autoLevels=False, lut=self.cmap[0])
-                    self.imgOrtho[j].setLevels(self.saturation[0][self.currentZ])
+                    self.imgOrtho[j].setImage(image, autoLevels=False, lut=lut_main)
+                # Apply the exact same levels as the main view
+                if levels_main is not None:
+                    self.imgOrtho[j].setLevels(levels_main)
 
             # Tight Z extents without padding so images align at left/top.
             # Prevent linked axes (to p0) from being altered by aspect lock; restore them after setting Z ranges.
@@ -611,6 +652,15 @@ class MainW_ortho2D(MainW):
 
         for j in range(2):
             self.layerOrtho[j].setImage(self.layer_ortho[j])
+
+        # Restore main view range (prevents zoom resets from axis-link side effects)
+        if p0_xr is not None and p0_yr is not None:
+            try:
+                self.p0.setXRange(p0_xr[0], p0_xr[1], padding=0)
+                self.p0.setYRange(p0_yr[0], p0_yr[1], padding=0)
+            except Exception:
+                pass
+
         self.win.show()
         self.show()
 
@@ -627,11 +677,8 @@ class MainW_ortho2D(MainW):
                 and not event.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.AltModifier)\
                 and not self.removing_region:
             if event.double():
-                try:
-                    self.p0.setYRange(0, self.Ly + self.pr)
-                except Exception:
-                    self.p0.setYRange(0, self.Ly)
-                self.p0.setXRange(0, self.Lx)
+                # Disable double-click zoom reset in ortho mode
+                return
             elif self.loaded and not self.in_stroke:
                 if self.orthobtn.isChecked():
                     items = self.win.scene().items(event.scenePos())
