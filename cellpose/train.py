@@ -2,7 +2,6 @@ import time
 import os
 import numpy as np
 from cellpose import io, utils, models, dynamics
-from cellpose.optimizers import create_optimizer
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
@@ -312,11 +311,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               test_labels=None, test_files=None, test_labels_files=None,
               test_probs=None, channel_axis=None,
               load_files=True, batch_size=1, learning_rate=5e-5, SGD=False,
-              n_epochs=100, weight_decay=0.1, momentum=0.9, normalize=True,
-              compute_flows=False, save_path=None, save_every=100,
-              save_each=False, nimg_per_epoch=None, nimg_test_per_epoch=None,
-              rescale=False, scale_range=None, bsize=256, min_train_masks=5,
-              model_name=None, class_weights=None, optimizer=None):
+              n_epochs=100, weight_decay=0.1, normalize=True, compute_flows=False,
+              save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
+              nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
+              min_train_masks=5, model_name=None, class_weights=None):
     """
     Train the network with images for segmentation.
 
@@ -337,9 +335,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         learning_rate (float or List[float], optional): Float or list/np.ndarray - learning rate for training. Defaults to 0.005.
         n_epochs (int, optional): Integer - number of times to go through the whole training set during training. Defaults to 2000.
         weight_decay (float, optional): Float - weight decay for the optimizer. Defaults to 1e-5.
-        momentum (float, optional): Float - momentum for the optimizer (used for SGD). Defaults to 0.9.
-        SGD (bool, optional): Deprecated in v4.0.1+ - ignored unless `optimizer` is set. Defaults to False.
-        optimizer (str or None, optional): Optimizer to use; one of 'adamw', 'sgd', or 'muon'. Defaults to 'adamw' if None.
+        momentum (float, optional): Float - momentum for the optimizer. Defaults to 0.9.
+        SGD (bool, optional): Deprecated in v4.0.1+ - AdamW always used.
         normalize (bool or dict, optional): Boolean or dictionary - whether to normalize the data. Defaults to True.
         compute_flows (bool, optional): Boolean - whether to compute flows during training. Defaults to False.
         save_path (str, optional): String - where to save the trained model. Defaults to None.
@@ -355,10 +352,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
        
     """
-    if SGD and optimizer is None:
-        train_logger.warning("SGD flag is deprecated; use --optimizer sgd instead. Continuing with AdamW.")
-    if SGD and optimizer is not None:
-        train_logger.warning("SGD flag is deprecated and ignored when --optimizer is provided.")
+    if SGD:
+        train_logger.warning("SGD is deprecated, using AdamW instead")
 
     device = net.device
 
@@ -423,15 +418,11 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             LR = np.append(LR, LR[-1] / 2 * np.ones(5))
 
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
-
-    opt_name = str(optimizer).lower() if optimizer is not None else "adamw"
-    optimizer = create_optimizer(
-        net.parameters(),
-        name=opt_name,
-        lr=learning_rate,
-        weight_decay=weight_decay,
-        momentum=momentum,
+    train_logger.info(
+        f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}"
     )
+    optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate,
+                                    weight_decay=weight_decay)
 
     t0 = time.time()
     model_name = f"cellpose_{t0}" if model_name is None else model_name
