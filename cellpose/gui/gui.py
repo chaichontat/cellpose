@@ -23,6 +23,7 @@ from ..io import get_image_files, imsave, imread
 from ..transforms import resize_image, normalize99, normalize99_tile, smooth_sharpen_img
 from ..models import normalize_default
 from ..plot import disk
+from ..contrib.diff import contour_diff_rgb
 
 try:
     import matplotlib.pyplot as plt
@@ -521,6 +522,30 @@ class MainW(QMainWindow):
 
         widget_row += 1
 
+        self.diffButton = QPushButton("diff")
+        self.diffButton.setFont(self.medfont)
+        self.diffButton.setEnabled(False)
+        self.diffButton.clicked.connect(self.show_segmentation_diff)
+        self.segBoxG.addWidget(self.diffButton, widget_row, 0, 1, 3)
+
+        self.maskToggleButton = QPushButton("reset mask")
+        self.maskToggleButton.setFont(self.medfont)
+        self.maskToggleButton.setEnabled(False)
+        self.maskToggleButton.clicked.connect(self.toggle_mask_restore)
+        self.segBoxG.addWidget(self.maskToggleButton, widget_row, 3, 1, 3)
+
+        self._diff_fig = None
+        self._diff_ax = None
+        self._diff_crosshair_lines = None
+        self._diff_last_shape = None
+        self._diff_last_crosshair = None
+
+        self._diff_state_old = None
+        self._diff_state_new = None
+        self._diff_showing_restored = False
+
+        widget_row += 1
+
         ############################### Segmentation settings ###############################
         self.additional_seg_settings_qcollapsible = QCollapsible("additional settings")
         self.additional_seg_settings_qcollapsible.setFont(self.medfont)
@@ -800,6 +825,7 @@ class MainW(QMainWindow):
 
         self.update_plot()
         self.setWindowTitle(self.filename)
+        self._diff_refresh_seg_path()
 
     def disable_buttons_removeROIs(self):
         if len(self.model_strings) > 0:
@@ -823,6 +849,7 @@ class MainW(QMainWindow):
         self.update_layer()
         self.toggle_saving()
         self.toggle_removals()
+        self._diff_update_button_state()
 
     def toggle_saving(self):
         if self.ncells > 0:
@@ -837,6 +864,344 @@ class MainW(QMainWindow):
             self.saveFlows.setEnabled(False)
             self.saveOutlines.setEnabled(False)
             self.saveROIs.setEnabled(False)
+
+    def _diff_refresh_seg_path(self):
+        self._diff_state_old = None
+        if isinstance(self.filename, str) and self.filename:
+            candidate = os.path.splitext(self.filename)[0] + "_seg.npy"
+            if os.path.exists(candidate):
+                self._diff_seg_path = candidate
+                self._diff_get_saved_state(reload=True)
+            else:
+                self._diff_seg_path = None
+        else:
+            self._diff_seg_path = None
+        self._diff_update_button_state()
+
+    def _diff_update_button_state(self):
+        if not hasattr(self, "diffButton"):
+            return
+        has_saved = self._diff_seg_path is not None and os.path.exists(self._diff_seg_path)
+        has_prediction = isinstance(self._diff_latest_masks, np.ndarray)
+        prediction_dims_ok = False
+        if has_prediction:
+            try:
+                prediction_dims_ok = np.asarray(self._diff_latest_masks).ndim >= 2
+            except Exception:
+                prediction_dims_ok = False
+        enabled = bool(has_saved and has_prediction and prediction_dims_ok)
+
+        self.diffButton.setEnabled(enabled)
+        if not has_saved:
+            diff_tip = "Load an image with an existing _seg.npy to enable diff."
+        elif not has_prediction or not prediction_dims_ok:
+            diff_tip = "Run a segmentation model to enable diff."
+        else:
+            diff_tip = ("Compare current Z plane against saved _seg.npy."
+                        if getattr(self, "NZ", 1) > 1
+                        else "Open contour diff against saved _seg.npy.")
+            if not MATPLOTLIB:
+                diff_tip += " (Matplotlib required; click to see installation hint.)"
+        self.diffButton.setToolTip(diff_tip)
+
+        if hasattr(self, "maskToggleButton"):
+            can_reset, reset_tip = self._diff_can_reset()
+            self.maskToggleButton.setEnabled(can_reset)
+            if self._diff_showing_restored:
+                self.maskToggleButton.setText("show new mask")
+                base_tip = "Show latest model prediction"
+            else:
+                self.maskToggleButton.setText("reset mask")
+                base_tip = "Show saved _seg.npy segmentation"
+            self.maskToggleButton.setToolTip(base_tip if can_reset else reset_tip)
+
+    def get_crosshair_coords(self):
+        return None
+
+    def _diff_on_close(self, event):
+        if getattr(event, "canvas", None) is None:
+            return
+        if getattr(event.canvas, "figure", None) is not getattr(self, "_diff_fig", None):
+            return
+        self._diff_fig = None
+        self._diff_ax = None
+        self._diff_crosshair_lines = None
+        self._diff_last_shape = None
+        self._diff_last_crosshair = None
+
+    def _diff_update_crosshair_lines(self, coords=None):
+        if not MATPLOTLIB:
+            return
+        fig = getattr(self, "_diff_fig", None)
+        ax = getattr(self, "_diff_ax", None)
+        if fig is None or ax is None:
+            return
+        if not plt.fignum_exists(fig.number):
+            self._diff_fig = None
+            self._diff_ax = None
+            self._diff_crosshair_lines = None
+            self._diff_last_shape = None
+            return
+        if coords is None:
+            coords = self.get_crosshair_coords()
+        self._diff_last_crosshair = coords
+        if coords is None:
+            return
+        y, x = map(float, coords)
+        if self._diff_last_shape:
+            h, w = self._diff_last_shape
+            if h > 0 and w > 0:
+                y = float(np.clip(y, 0, h - 1))
+                x = float(np.clip(x, 0, w - 1))
+        if self._diff_crosshair_lines is None:
+            line_kwargs = {"color": "cyan", "linewidth": 0.8, "alpha": 0.7, "linestyle": "--"}
+            hline = ax.axhline(y, **line_kwargs)
+            vline = ax.axvline(x, **line_kwargs)
+            self._diff_crosshair_lines = (hline, vline)
+        else:
+            hline, vline = self._diff_crosshair_lines
+            hline.set_ydata([y, y])
+            vline.set_xdata([x, x])
+        fig.canvas.draw_idle()
+
+    def _diff_can_reset(self) -> tuple[bool, str]:
+        state_old = self._diff_get_saved_state(reload=False)
+        if state_old is None or state_old.get("masks") is None:
+            return False, "Saved _seg.npy masks unavailable for reset."
+        if self._diff_state_new is None or self._diff_state_new.get("masks") is None:
+            return False, "Run a segmentation model before resetting masks."
+        try:
+            old_masks = np.asarray(state_old["masks"])
+            new_masks = np.asarray(self._diff_state_new["masks"])
+        except Exception:
+            return False, "Masks could not be compared for reset."
+        old_masks = np.squeeze(old_masks)
+        new_masks = np.squeeze(new_masks)
+        if old_masks.ndim == 2:
+            old_masks = old_masks[np.newaxis, ...]
+        if new_masks.ndim == 2:
+            new_masks = new_masks[np.newaxis, ...]
+        if old_masks.shape != new_masks.shape:
+            return False, "Saved masks shape does not match the model result."
+        return True, ""
+
+    def _diff_get_saved_state(self, reload: bool = False):
+        if self._diff_seg_path is None:
+            self._diff_state_old = None
+            return None
+        if not reload and self._diff_state_old is not None:
+            return self._diff_state_old
+        try:
+            dat = np.load(self._diff_seg_path, allow_pickle=True).item()
+        except Exception as exc:
+            print(f"GUI_WARNING: failed to load saved masks for diff: {exc}")
+            self._diff_state_old = None
+            return None
+        masks = dat.get("masks")
+        if masks is None:
+            self._diff_state_old = None
+            return None
+        masks = np.asarray(masks)
+        if masks.ndim == 2:
+            masks = masks[np.newaxis, ...]
+        outlines = dat.get("outlines")
+        if outlines is not None:
+            outlines = np.asarray(outlines)
+            if outlines.ndim == 2:
+                outlines = outlines[np.newaxis, ...]
+        colors = dat.get("colors")
+        if colors is not None:
+            colors = np.asarray(colors)
+        state = {
+            "masks": masks.astype(masks.dtype, copy=True),
+            "outlines": outlines.astype(outlines.dtype, copy=True) if isinstance(outlines, np.ndarray) else outlines,
+            "colors": colors.astype(colors.dtype, copy=True) if isinstance(colors, np.ndarray) else colors,
+        }
+        self._diff_state_old = state
+        return state
+
+    def _diff_store_current_as_new(self):
+        try:
+            masks = np.asarray(self.cellpix).copy()
+            outlines = np.asarray(self.outpix).copy()
+            getter = getattr(self.ncells, "get", None)
+            if callable(getter):
+                try:
+                    ncells = int(getter())
+                except Exception:
+                    ncells = 0
+            else:
+                try:
+                    ncells = int(self.ncells)
+                except Exception:
+                    ncells = 0
+            colors = None
+            if ncells > 0 and isinstance(self.cellcolors, np.ndarray):
+                colors_slice = self.cellcolors[1:ncells + 1]
+                if colors_slice.size > 0:
+                    colors = colors_slice.copy()
+        except Exception:
+            self._diff_state_new = None
+            self._diff_latest_masks = None
+            return
+        self._diff_state_new = {
+            "masks": masks,
+            "outlines": outlines,
+            "colors": colors,
+        }
+        self._diff_latest_masks = masks.copy()
+
+    def _diff_apply_state(self, state: dict, treat_as_new: bool):
+        if state is None or state.get("masks") is None:
+            raise ValueError("diff state missing masks")
+        masks = np.array(state["masks"], copy=True)
+        outlines = state.get("outlines")
+        colors = state.get("colors")
+        outlines_copy = np.array(outlines, copy=True) if isinstance(outlines, np.ndarray) else outlines
+        colors_copy = np.array(colors, copy=True) if isinstance(colors, np.ndarray) else colors
+        io._masks_to_gui(self, masks, outlines=outlines_copy, colors=colors_copy)
+        if treat_as_new:
+            self._diff_store_current_as_new()
+
+    def show_segmentation_diff(self):
+        if not MATPLOTLIB:
+            QMessageBox.warning(self, "Diff viewer unavailable",
+                                "Install matplotlib to view segmentation diffs.")
+            return
+        if self._diff_seg_path is None or not os.path.exists(self._diff_seg_path):
+            QMessageBox.warning(self, "Saved segmentation missing",
+                                "Expected _seg.npy not found for this image.")
+            return
+        if self._diff_latest_masks is None:
+            QMessageBox.information(self, "No model result",
+                                    "Run a segmentation model before viewing the diff.")
+            return
+
+        saved_state = self._diff_get_saved_state(reload=True)
+        if saved_state is None:
+            QMessageBox.critical(
+                self, "Failed to load _seg.npy",
+                f"Could not read {os.path.basename(self._diff_seg_path)}.")
+            return
+        saved_masks = saved_state.get("masks")
+        if saved_masks is None:
+            QMessageBox.critical(
+                self, "Invalid _seg.npy", "The segmentation file does not contain a 'masks' entry.")
+            return
+
+        saved_masks = np.squeeze(np.asarray(saved_masks))
+        current_masks = np.squeeze(np.asarray(self._diff_latest_masks))
+
+        def _select_plane(arr, label):
+            if arr.ndim == 2:
+                return arr, None
+            if arr.ndim == 3:
+                if arr.shape[0] == 0:
+                    raise ValueError(f"{label} masks array has zero Z-planes.")
+                z_idx = int(np.clip(self.currentZ, 0, arr.shape[0] - 1))
+                return arr[z_idx], z_idx
+            raise ValueError(f"{label} masks array has unsupported ndim={arr.ndim}.")
+
+        try:
+            saved_plane, saved_z = _select_plane(saved_masks, "Saved")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Unsupported saved masks", str(exc))
+            return
+
+        try:
+            current_plane, current_z = _select_plane(current_masks, "Current")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Unsupported current masks", str(exc))
+            return
+
+        if saved_masks.ndim == 3 and current_masks.ndim == 3:
+            if saved_masks.shape[0] != current_masks.shape[0]:
+                QMessageBox.warning(
+                    self, "Z-stack mismatch",
+                    f"Saved masks have {saved_masks.shape[0]} planes, model result has "
+                    f"{current_masks.shape[0]} planes.")
+                return
+            z_index = int(np.clip(self.currentZ, 0, saved_masks.shape[0] - 1))
+            saved_plane = saved_masks[z_index]
+            current_plane = current_masks[z_index]
+        else:
+            z_index = saved_z if saved_z is not None else current_z if current_z is not None else 0
+
+        if saved_plane.shape != current_plane.shape:
+            QMessageBox.warning(
+                self, "Shape mismatch",
+                f"Saved plane shape {saved_plane.shape} does not match model result "
+                f"{current_plane.shape}.")
+            return
+
+        try:
+            diff_rgb = contour_diff_rgb(saved_plane.astype(np.int32),
+                                        current_plane.astype(np.int32))
+        except Exception as exc:
+            QMessageBox.critical(self, "Diff computation failed",
+                                 f"Contour comparison failed:\n{exc}")
+            return
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(diff_rgb)
+        ax.axis("off")
+        if getattr(self, "NZ", 1) > 1:
+            ax.set_title(f"Segmentation contour differences (z={z_index})")
+        else:
+            ax.set_title("Segmentation contour differences")
+        try:
+            fig.canvas.manager.set_window_title("Cellpose segmentation diff")
+        except Exception:
+            pass
+        fig.tight_layout()
+        self._diff_fig = fig
+        self._diff_ax = ax
+        self._diff_crosshair_lines = None
+        self._diff_last_shape = diff_rgb.shape[:2]
+        self._diff_last_crosshair = None
+        if hasattr(fig.canvas, "mpl_connect"):
+            fig.canvas.mpl_connect("close_event", self._diff_on_close)
+        self._diff_update_crosshair_lines()
+        fig.show()
+        plt.show(block=False)
+
+    def toggle_mask_restore(self):
+        can_reset, reason = self._diff_can_reset()
+        if not can_reset:
+            QMessageBox.information(self, "Mask reset unavailable", reason)
+            return
+        if self._diff_showing_restored:
+            if self._diff_state_new is None:
+                QMessageBox.warning(self, "Mask toggle failed",
+                                    "Model prediction masks are unavailable.")
+                return
+            try:
+                self._diff_showing_restored = False
+                self._diff_apply_state(self._diff_state_new, treat_as_new=True)
+                if hasattr(self, "maskToggleButton"):
+                    self.maskToggleButton.setText("reset mask")
+            except Exception as exc:
+                self._diff_showing_restored = False
+                QMessageBox.warning(self, "Mask toggle failed",
+                                    f"Could not restore model masks:\n{exc}")
+        else:
+            state_old = self._diff_get_saved_state(reload=True)
+            if state_old is None or state_old.get("masks") is None:
+                QMessageBox.warning(self, "Mask toggle failed",
+                                    "Saved masks could not be loaded.")
+                return
+            try:
+                self._diff_showing_restored = True
+                self._diff_apply_state(state_old, treat_as_new=False)
+                if hasattr(self, "maskToggleButton"):
+                    self.maskToggleButton.setText("show new mask")
+            except Exception as exc:
+                self._diff_showing_restored = False
+                QMessageBox.warning(self, "Mask toggle failed",
+                                    f"Could not apply saved masks:\n{exc}")
+
+        self._diff_update_button_state()
+        self._diff_update_crosshair_lines()
 
     def toggle_removals(self):
         if self.ncells > 0:
@@ -1110,6 +1475,21 @@ class MainW(QMainWindow):
         self.filename = []
         self.loaded = False
         self.recompute_masks = False
+        self._diff_seg_path = None
+        self._diff_latest_masks = None
+        self._diff_state_old = None
+        self._diff_state_new = None
+        self._diff_fig = None
+        self._diff_ax = None
+        self._diff_crosshair_lines = None
+        self._diff_last_shape = None
+        self._diff_last_crosshair = None
+        self._diff_showing_restored = False
+        if hasattr(self, "diffButton"):
+            self.diffButton.setEnabled(False)
+        if hasattr(self, "maskToggleButton"):
+            self.maskToggleButton.setEnabled(False)
+            self.maskToggleButton.setText("reset mask")
 
         self.deleting_multiple = False
         self.removing_cells_list = []
@@ -2012,6 +2392,8 @@ class MainW(QMainWindow):
 
     def compute_segmentation(self, custom=False, model_name=None, load_model=True):
         self.progress.setValue(0)
+        self._diff_latest_masks = None
+        self._diff_update_button_state()
         try:
             tic = time.time()
             self.clear_all()
@@ -2124,6 +2506,9 @@ class MainW(QMainWindow):
             io._masks_to_gui(self, masks, outlines=None)
             self.masksOn = True
             self.MCheckBox.setChecked(True)
+            self._diff_store_current_as_new()
+            self._diff_showing_restored = False
+            self._diff_update_button_state()
             self.progress.setValue(100)
             if self.restore != "filter" and self.restore is not None and self.autobtn.isChecked():
                 self.compute_saturation()

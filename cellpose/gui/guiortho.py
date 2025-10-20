@@ -487,6 +487,10 @@ class MainW_ortho2D(MainW):
         self.hLineOrtho[1].setPos(self.zc)
         self.vLineOrtho[0].setPos(self.zc)
         self.hLineOrtho[0].setPos(self.yortho)
+        self._diff_update_crosshair_lines((self.yortho, self.xortho))
+
+    def get_crosshair_coords(self):
+        return float(self.yortho), float(self.xortho)
 
     # Developer note (gui_ortho invariants):
     # - Do not change main XY view (self.p0) ranges in this function.
