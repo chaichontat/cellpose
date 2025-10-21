@@ -536,9 +536,18 @@ class MainW(QMainWindow):
 
         self._diff_fig = None
         self._diff_ax = None
+        self._diff_img_im = None
+        self._diff_diff_rgb = None
+        self._diff_click_cid = None
+        self._diff_scroll_cid = None
+        self._diff_z_index = None
         self._diff_crosshair_lines = None
         self._diff_last_shape = None
         self._diff_last_crosshair = None
+        self._diff_drag_active = False
+        self._diff_drag_last_update = 0.0
+        self._diff_drag_interval = 1.0 / 15.0
+        self._diff_zoom_min_span = 5.0
 
         self._diff_state_old = None
         self._diff_state_new = None
@@ -695,6 +704,11 @@ class MainW(QMainWindow):
             self.update_plot()
 
     def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Space and not event.isAutoRepeat():
+            self._diff_drag_active = True
+            self._diff_drag_last_update = 0.0
+            event.accept()
+            return
         if self.loaded:
             if not (event.modifiers() &
                     (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier |
@@ -765,6 +779,13 @@ class MainW(QMainWindow):
                     self.update_plot()
         if event.key() == QtCore.Qt.Key_Minus or event.key() == QtCore.Qt.Key_Equal:
             self.p0.keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Space and not event.isAutoRepeat():
+            self._diff_drag_active = False
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
     def autosave_on(self):
         if self.SCheckBox.isChecked():
@@ -916,19 +937,38 @@ class MainW(QMainWindow):
             self.maskToggleButton.setToolTip(base_tip if can_reset else reset_tip)
 
     def get_crosshair_coords(self):
-        return None
+        return self._diff_last_crosshair
 
     def _diff_on_close(self, event):
         if getattr(event, "canvas", None) is None:
             return
         if getattr(event.canvas, "figure", None) is not getattr(self, "_diff_fig", None):
             return
+        self._diff_disconnect_handlers(event.canvas)
         self._diff_fig = None
         self._diff_ax = None
+        self._diff_img_im = None
+        self._diff_diff_rgb = None
+        self._diff_click_cid = None
+        self._diff_scroll_cid = None
+        self._diff_z_index = None
         self._diff_crosshair_lines = None
         self._diff_last_shape = None
         self._diff_last_crosshair = None
 
+    def _diff_disconnect_handlers(self, canvas):
+        if canvas is None:
+            return
+        if self._diff_click_cid is not None:
+            try:
+                canvas.mpl_disconnect(self._diff_click_cid)
+            except Exception:
+                pass
+        if self._diff_scroll_cid is not None:
+            try:
+                canvas.mpl_disconnect(self._diff_scroll_cid)
+            except Exception:
+                pass
     def _diff_update_crosshair_lines(self, coords=None):
         if not MATPLOTLIB:
             return
@@ -939,6 +979,10 @@ class MainW(QMainWindow):
         if not plt.fignum_exists(fig.number):
             self._diff_fig = None
             self._diff_ax = None
+            self._diff_img_im = None
+            self._diff_diff_rgb = None
+            self._diff_click_cid = None
+            self._diff_z_index = None
             self._diff_crosshair_lines = None
             self._diff_last_shape = None
             return
@@ -1062,6 +1106,402 @@ class MainW(QMainWindow):
         io._masks_to_gui(self, masks, outlines=outlines_copy, colors=colors_copy)
         if treat_as_new:
             self._diff_store_current_as_new()
+        # refresh overlay if open
+        try:
+            self._diff_refresh_overlay()
+        except Exception:
+            pass
+
+    # ===== Interactive diff viewer helpers =====
+    def _diff_get_planes(self):
+        """Return (saved_plane, current_plane, z_index) for active Z."""
+        state_old = self._diff_get_saved_state(reload=False)
+        state_new = self._diff_state_new
+        if state_old is None or state_new is None:
+            return None
+        old_masks = np.asarray(state_old.get("masks"))
+        new_masks = np.asarray(state_new.get("masks"))
+        if old_masks.ndim == 2:
+            z_idx = 0
+            saved_plane = old_masks
+        else:
+            z_idx = int(np.clip(self.currentZ, 0, old_masks.shape[0] - 1))
+            saved_plane = old_masks[z_idx]
+        if new_masks.ndim == 2:
+            current_plane = new_masks
+        else:
+            z_idx = int(np.clip(self.currentZ, 0, new_masks.shape[0] - 1))
+            current_plane = new_masks[z_idx]
+        return saved_plane, current_plane, z_idx
+
+    def _diff_recompute_overlay(self):
+        planes = self._diff_get_planes()
+        if planes is None:
+            return None
+        saved_plane, current_plane, z_idx = planes
+        try:
+            diff_rgb = contour_diff_rgb(saved_plane.astype(np.int32),
+                                        current_plane.astype(np.int32))
+        except Exception:
+            return None
+        self._diff_diff_rgb = diff_rgb
+        self._diff_last_shape = diff_rgb.shape[:2]
+        self._diff_z_index = z_idx
+        return diff_rgb
+
+    def _diff_refresh_overlay(self):
+        if not MATPLOTLIB:
+            return
+        if self._diff_fig is None or self._diff_ax is None:
+            return
+        if not plt.fignum_exists(self._diff_fig.number):
+            return
+        prev_xlim = self._diff_ax.get_xlim() if self._diff_ax is not None else None
+        prev_ylim = self._diff_ax.get_ylim() if self._diff_ax is not None else None
+
+        diff_rgb = self._diff_recompute_overlay()
+        if diff_rgb is None:
+            return
+        bounds = self._diff_get_bounds()
+        if self._diff_img_im is None:
+            self._diff_ax.clear()
+            self._diff_img_im = self._diff_ax.imshow(
+                diff_rgb,
+                interpolation="nearest",
+                origin="upper",
+                extent=(-0.5, diff_rgb.shape[1] - 0.5, diff_rgb.shape[0] - 0.5, -0.5),
+            )
+            self._diff_ax.axis("off")
+        else:
+            self._diff_img_im.set_data(diff_rgb)
+            self._diff_img_im.set_extent(
+                (-0.5, diff_rgb.shape[1] - 0.5, diff_rgb.shape[0] - 0.5, -0.5)
+            )
+        if bounds is not None:
+            if prev_xlim is None or prev_ylim is None:
+                self._diff_ax.set_xlim(bounds[0], bounds[1])
+                self._diff_ax.set_ylim(bounds[2], bounds[3])
+            else:
+                self._diff_ax.set_xlim(*prev_xlim)
+                self._diff_ax.set_ylim(*prev_ylim)
+                self._diff_clamp_view()
+        self._diff_fig.canvas.draw_idle()
+        self._diff_update_crosshair_lines()
+
+    def _diff_log(self, message: str):
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            try:
+                logger.info(message)
+                return
+            except Exception:
+                pass
+        print(f"GUI_INFO: {message}")
+
+    def _diff_get_bounds(self):
+        if self._diff_diff_rgb is None:
+            return None
+        height, width = self._diff_diff_rgb.shape[:2]
+        return (-0.5, width - 0.5, height - 0.5, -0.5)
+
+    def _diff_clamp_view(self):
+        bounds = self._diff_get_bounds()
+        if bounds is None or self._diff_ax is None:
+            return
+        x_min, x_max, y_max, y_min = bounds  # note y order
+        ax = self._diff_ax
+        xlo, xhi = ax.get_xlim()
+        ylo, yhi = ax.get_ylim()
+
+        xlo, xhi = self._diff_clamp_interval(xlo, xhi, x_min, x_max)
+        ylo, yhi = self._diff_clamp_interval(ylo, yhi, y_min, y_max)
+        ax.set_xlim(xlo, xhi)
+        ax.set_ylim(ylo, yhi)
+
+    def _diff_clamp_interval(self, lo, hi, min_val, max_val):
+        """Clamp [lo, hi] (respecting orientation) into [min_val, max_val]."""
+        if min_val > max_val:
+            min_val, max_val = max_val, min_val
+        length = abs(hi - lo)
+        full_length = max_val - min_val
+        if length > full_length:
+            # reset to full
+            return (min_val, max_val) if lo <= hi else (max_val, min_val)
+        # shift if out of bounds
+        low = min(lo, hi)
+        high = max(lo, hi)
+        if low < min_val:
+            delta = min_val - low
+            lo += delta
+            hi += delta
+        if max(lo, hi) > max_val:
+            delta = max(lo, hi) - max_val
+            lo -= delta
+            hi -= delta
+        return lo, hi
+
+    @staticmethod
+    def _diff_color_kind(rgb):
+        """Classify pixel color into 'old', 'new', or 'other'."""
+        only_a = np.array([255, 80, 255], dtype=np.float32)  # magenta (old)
+        only_b = np.array([135, 205, 135], dtype=np.float32) # green (new)
+        node_a = np.array([255, 0, 255], dtype=np.float32)   # bright magenta
+        node_b = np.array([0, 255, 0], dtype=np.float32)     # bright green
+        yellow = np.array([255, 255, 0], dtype=np.float32)
+        gray = np.array([150, 150, 150], dtype=np.float32)
+
+        v = np.array(rgb, dtype=np.float32)
+        def d2(a):
+            diff = v - a
+            return float(diff.dot(diff))
+        tol = 2000
+        if min(d2(only_a), d2(node_a)) <= tol and d2(yellow) > tol and d2(gray) > tol:
+            return 'old'
+        if min(d2(only_b), d2(node_b)) <= tol and d2(yellow) > tol and d2(gray) > tol:
+            return 'new'
+        return 'other'
+
+    @staticmethod
+    def _find_nonzero_label_near(L, y, x, max_radius=10):
+        h, w = L.shape
+        yi = int(round(float(y)))
+        xi = int(round(float(x)))
+        yi = max(0, min(h - 1, yi))
+        xi = max(0, min(w - 1, xi))
+        if L[yi, xi] != 0:
+            return int(L[yi, xi])
+        for r in range(1, max_radius + 1):
+            y0 = max(0, yi - r)
+            y1 = min(h, yi + r + 1)
+            x0 = max(0, xi - r)
+            x1 = min(w, xi + r + 1)
+            patch = L[y0:y1, x0:x1]
+            nz = patch[patch != 0]
+            if nz.size > 0:
+                vals, counts = np.unique(nz, return_counts=True)
+                return int(vals[np.argmax(counts)])
+        return 0
+
+    def _diff_accept_old_at(self, y, x):
+        planes = self._diff_get_planes()
+        if planes is None:
+            return False
+        saved_plane, current_plane, z_idx = planes
+        old_id = self._find_nonzero_label_near(saved_plane, y, x)
+        if old_id == 0:
+            return False
+        old_mask = (saved_plane == old_id)
+        if not np.any(old_mask):
+            return False
+        state_new = self._diff_state_new
+        if state_new is None or state_new.get("masks") is None:
+            return False
+        new_masks = np.array(state_new["masks"], copy=True)
+        if new_masks.ndim == 2:
+            new_slice = new_masks
+        else:
+            new_slice = new_masks[z_idx]
+        # Remove conflicting labels entirely from the slice
+        overlapping = np.unique(new_slice[old_mask])
+        overlapping = overlapping[overlapping != 0]
+        for oid in overlapping:
+            new_slice[new_slice == oid] = 0
+        # Insert old label region as a fresh label id
+        new_id = int(new_slice.max()) + 1
+        new_slice[old_mask] = new_id
+        if new_masks.ndim != 2:
+            new_masks[z_idx] = new_slice
+        new_state = {
+            "masks": new_masks,
+            "outlines": None,
+            "colors": None,
+        }
+        self._diff_apply_state(new_state, treat_as_new=True)
+        self._diff_log(f"diff viewer accepted saved label -> inserted old ID as {new_id}")
+        return True
+
+    def _diff_accept_new_at(self, y, x):
+        planes = self._diff_get_planes()
+        if planes is None:
+            return False
+        saved_plane, current_plane, z_idx = planes
+        new_id = self._find_nonzero_label_near(current_plane, y, x)
+        if new_id == 0:
+            return False
+        new_mask = (current_plane == new_id)
+        if not np.any(new_mask):
+            return False
+        state_old = self._diff_state_old
+        if state_old is None or state_old.get("masks") is None:
+            state_old = self._diff_get_saved_state(reload=False)
+            if state_old is None or state_old.get("masks") is None:
+                return False
+        old_masks = np.array(state_old["masks"], copy=True)
+        if old_masks.ndim == 2:
+            old_slice = old_masks
+        else:
+            old_slice = old_masks[z_idx]
+        overlapping = np.unique(old_slice[new_mask])
+        overlapping = overlapping[overlapping != 0]
+        for oid in overlapping:
+            old_slice[old_slice == oid] = 0
+        old_slice[new_mask] = new_id
+        if old_masks.ndim != 2:
+            old_masks[z_idx] = old_slice
+        self._diff_state_old = {
+            "masks": old_masks,
+            "outlines": None,
+            "colors": None,
+        }
+        if self._diff_showing_restored:
+            try:
+                self._diff_apply_state(self._diff_state_old, treat_as_new=False)
+            except Exception:
+                pass
+        self._diff_log(f"diff viewer accepted model label -> saved mask updated to ID {new_id}")
+        return True
+
+    def _diff_click_to_indices(self, x: float, y: float):
+        """Map matplotlib data coords (x, y) to array indices (row, col)."""
+        if self._diff_img_im is None or self._diff_diff_rgb is None:
+            return None
+        arr = np.asarray(self._diff_diff_rgb)
+        if arr.ndim < 2:
+            return None
+        height, width = arr.shape[:2]
+        if height == 0 or width == 0:
+            return None
+
+        extent = self._diff_img_im.get_extent()
+        if extent is None:
+            extent = (-0.5, width - 0.5, height - 0.5, -0.5)
+        x0, x1, y0, y1 = extent
+        if x0 == x1 or y0 == y1:
+            return None
+
+        # Normalize coordinates in [0, 1]
+        u = (x - x0) / (x1 - x0)
+        v = (y - y0) / (y1 - y0)
+
+        if np.isnan(u) or np.isnan(v):
+            return None
+
+        if x1 < x0:
+            u = 1.0 - u
+        if y1 < y0:
+            v = 1.0 - v
+
+        col = int(np.floor(u * width))
+        row = int(np.floor(v * height))
+
+        if col < 0 or col >= width or row < 0 or row >= height:
+            return None
+
+        return row, col
+
+    def _on_diff_click(self, event):
+        if event is None or event.inaxes is None or event.button != 1:
+            return
+        if event.inaxes is not self._diff_ax:
+            self._diff_log("diff viewer click ignored (outside diff axes)")
+            return
+        x = event.xdata
+        y = event.ydata
+        if x is None or y is None:
+            self._diff_log("diff viewer click ignored (no data coords)")
+            return
+        if self._diff_diff_rgb is None:
+            return
+        mapped = self._diff_click_to_indices(float(x), float(y))
+        if mapped is None:
+            self._diff_log("diff viewer click ignored (outside image extent)")
+            return
+        yi, xi = mapped
+        rgb = self._diff_diff_rgb[yi, xi]
+        kind = self._diff_color_kind(rgb)
+        self._diff_log(
+            f"diff viewer click at (y={yi}, x={xi}) classified as '{kind}' with rgb={rgb.tolist()}"
+        )
+        if kind == 'old':
+            changed = self._diff_accept_old_at(yi, xi)
+            if changed:
+                self._diff_log("diff viewer overlay refresh after accepting old")
+                self._diff_refresh_overlay()
+            else:
+                self._diff_log("diff viewer old acceptance skipped (no change)")
+        elif kind == 'new':
+            changed = self._diff_accept_new_at(yi, xi)
+            if changed:
+                self._diff_log("diff viewer overlay refresh after accepting new")
+                self._diff_refresh_overlay()
+            else:
+                self._diff_log("diff viewer new acceptance skipped (no change)")
+        else:
+            self._diff_log("diff viewer click classified as 'other'; no action taken")
+
+    def _on_diff_scroll(self, event):
+        if event is None or event.inaxes is not self._diff_ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        bounds = self._diff_get_bounds()
+        if bounds is None:
+            return
+        x_min, x_max, y_max, y_min = bounds
+        ax = self._diff_ax
+        current_xlim = ax.get_xlim()
+        current_ylim = ax.get_ylim()
+        span_x = abs(current_xlim[1] - current_xlim[0])
+        span_y = abs(current_ylim[1] - current_ylim[0])
+        full_span_x = x_max - x_min
+        full_span_y = y_max - y_min
+        if span_x <= 0 or span_y <= 0:
+            return
+
+        # Determine zoom factor
+        step = getattr(event, "step", 0)
+        if step == 0:
+            step = 1 if getattr(event, "button", "up") == "up" else -1
+        zoom_in = step > 0
+        scale = 0.8 if zoom_in else 1.25
+
+        min_span = getattr(self, "_diff_zoom_min_span", 5.0)
+
+        def compute_limits(current_range, center, full_min, full_max):
+            orientation = 1 if current_range[1] >= current_range[0] else -1
+            span = abs(current_range[1] - current_range[0])
+            new_span = span * scale
+            new_span = max(min_span, min(new_span, full_max - full_min))
+            half = new_span / 2.0
+            if orientation == 1:
+                lo = center - half
+                hi = center + half
+            else:
+                lo = center + half
+                hi = center - half
+
+            # Clamp to bounds
+            low = min(lo, hi)
+            high = max(lo, hi)
+            if low < full_min:
+                delta = full_min - low
+                lo += delta
+                hi += delta
+            if high > full_max:
+                delta = high - full_max
+                lo -= delta
+                hi -= delta
+            return lo, hi
+
+        new_xlim = compute_limits(current_xlim, float(event.xdata), x_min, x_max)
+        new_ylim = compute_limits(current_ylim, float(event.ydata), y_min, y_max)
+        ax.set_xlim(*new_xlim)
+        ax.set_ylim(*new_ylim)
+        self._diff_log(
+            f"diff viewer scroll zoom to xlim={new_xlim}, ylim={new_ylim}"
+        )
+        self._diff_update_crosshair_lines()
+        ax.figure.canvas.draw_idle()
 
     def show_segmentation_diff(self):
         if not MATPLOTLIB:
@@ -1143,12 +1583,16 @@ class MainW(QMainWindow):
             return
 
         fig, ax = plt.subplots(figsize=(8, 8))
-        ax.imshow(diff_rgb)
+        height, width = diff_rgb.shape[:2]
+        im = ax.imshow(
+            diff_rgb,
+            interpolation="nearest",
+            origin="upper",
+            extent=(-0.5, width - 0.5, height - 0.5, -0.5),
+        )
         ax.axis("off")
-        if getattr(self, "NZ", 1) > 1:
-            ax.set_title(f"Segmentation contour differences (z={z_index})")
-        else:
-            ax.set_title("Segmentation contour differences")
+        ax.set_xlim(-0.5, width - 0.5)
+        ax.set_ylim(height - 0.5, -0.5)
         try:
             fig.canvas.manager.set_window_title("Cellpose segmentation diff")
         except Exception:
@@ -1156,14 +1600,20 @@ class MainW(QMainWindow):
         fig.tight_layout()
         self._diff_fig = fig
         self._diff_ax = ax
+        self._diff_img_im = im
+        self._diff_diff_rgb = diff_rgb
+        self._diff_z_index = z_index
         self._diff_crosshair_lines = None
         self._diff_last_shape = diff_rgb.shape[:2]
         self._diff_last_crosshair = None
         if hasattr(fig.canvas, "mpl_connect"):
             fig.canvas.mpl_connect("close_event", self._diff_on_close)
+            self._diff_click_cid = fig.canvas.mpl_connect("button_press_event", self._on_diff_click)
+            self._diff_scroll_cid = fig.canvas.mpl_connect("scroll_event", self._on_diff_scroll)
         self._diff_update_crosshair_lines()
         fig.show()
         plt.show(block=False)
+        self._diff_log("diff viewer open: click magenta to accept saved label, green to accept model label")
 
     def toggle_mask_restore(self):
         can_reset, reason = self._diff_can_reset()
@@ -1481,9 +1931,16 @@ class MainW(QMainWindow):
         self._diff_state_new = None
         self._diff_fig = None
         self._diff_ax = None
+        self._diff_img_im = None
+        self._diff_diff_rgb = None
+        self._diff_click_cid = None
+        self._diff_scroll_cid = None
+        self._diff_z_index = None
         self._diff_crosshair_lines = None
         self._diff_last_shape = None
         self._diff_last_crosshair = None
+        self._diff_drag_active = False
+        self._diff_drag_last_update = 0.0
         self._diff_showing_restored = False
         if hasattr(self, "diffButton"):
             self.diffButton.setEnabled(False)
@@ -1836,6 +2293,24 @@ class MainW(QMainWindow):
         self.update_layer()
 
     def mouse_moved(self, pos):
+        if self._diff_drag_active and self.loaded:
+            now = time.monotonic()
+            if now - self._diff_drag_last_update >= self._diff_drag_interval:
+                items = self.win.scene().items(pos)
+                if (self.p0 in items) or (self.img in items) or (self.layer in items):
+                    view_pos = self.p0.mapSceneToView(pos)
+                    x = view_pos.x()
+                    y = view_pos.y()
+                    if 0 <= x < self.Lx and 0 <= y < self.Ly:
+                        if getattr(self, "is_ortho2D", False):
+                            self.xortho = int(x)
+                            self.yortho = int(y)
+                            self.update_ortho()
+                        else:
+                            coords = (float(y), float(x))
+                            self._diff_last_crosshair = coords
+                            self._diff_update_crosshair_lines(coords)
+                self._diff_drag_last_update = now
         items = self.win.scene().items(pos)
 
     def color_choose(self):
@@ -2039,7 +2514,7 @@ class MainW(QMainWindow):
         # get diameter from gui
         diameter = self.segmentation_settings.diameter
         if not diameter:
-            diameter = 30
+            diameter = 60
 
         self.pr = int(diameter)
         self.radii_padding = int(self.pr * 1.25)

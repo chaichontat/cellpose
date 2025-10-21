@@ -11,9 +11,9 @@ import pathlib, os
 
 def stylesheet():
     return """
-        QToolTip { 
-                            background-color: black; 
-                            color: white; 
+        QToolTip {
+                            background-color: black;
+                            color: white;
                             border: black solid 1px
                             }
         QComboBox {color: white;
@@ -31,42 +31,42 @@ def stylesheet():
                     background: transparent;
                     border: none;
                     margin: 0px 0px 0px 0px;
-                } 
-                           
-        QGroupBox 
+                }
+
+        QGroupBox
             { border: 1px solid white; color: rgb(255,255,255);
                            border-radius: 6px;
                             margin-top: 8px;
-                            padding: 0px 0px;}            
-                           
-        QPushButton:pressed {Text-align: center; 
-                             background-color: rgb(150,50,150); 
+                            padding: 0px 0px;}
+
+        QPushButton:pressed {Text-align: center;
+                             background-color: rgb(150,50,150);
                              border-color: white;
                              color:white;}
-                            QToolTip { 
-                           background-color: black; 
-                           color: white; 
+                            QToolTip {
+                           background-color: black;
+                           color: white;
                            border: black solid 1px
                            }
-        QPushButton:!pressed {Text-align: center; 
+        QPushButton:!pressed {Text-align: center;
                                background-color: rgb(50,50,50);
                                 border-color: white;
                                color:white;}
-                                QToolTip { 
-                           background-color: black; 
-                           color: white; 
+                                QToolTip {
+                           background-color: black;
+                           color: white;
                            border: black solid 1px
                            }
-        QPushButton:disabled {Text-align: center; 
+        QPushButton:disabled {Text-align: center;
                              background-color: rgb(30,30,30);
                              border-color: white;
                               color:rgb(80,80,80);}
-                               QToolTip { 
-                           background-color: black; 
-                           color: white; 
+                               QToolTip {
+                           background-color: black;
+                           color: white;
                            border: black solid 1px
                            }
-                        
+
         """
 
 
@@ -179,7 +179,7 @@ class FilterButton(QPushButton):
 
 
 class ObservableVariable(QtCore.QObject):
-    valueChanged = QtCore.Signal(object) 
+    valueChanged = QtCore.Signal(object)
 
     def __init__(self, initial=None):
         super().__init__()
@@ -196,7 +196,7 @@ class ObservableVariable(QtCore.QObject):
 
     def __call__(self):
         return self._value
-    
+
     def reset(self):
         self.set(0)
 
@@ -205,28 +205,28 @@ class ObservableVariable(QtCore.QObject):
             raise TypeError("Value must be numeric.")
         self.set(self._value + amount)
         return self
-    
+
     def __radd__(self, other):
         return other + self._value
 
     def __add__(self, other):
         return other + self._value
-        
+
     def __isub__(self, amount):
         if not isinstance(amount, (int, float)):
             raise TypeError("Value must be numeric.")
         self.set(self._value - amount)
         return self
-    
+
     def __str__(self):
         return str(self._value)
-    
+
     def __lt__(self, x):
         return self._value < x
-    
+
     def __gt__(self, x):
         return self._value > x
-    
+
     def __eq__(self, x):
         return self._value == x
 
@@ -237,8 +237,8 @@ class NormalizationSettings(QWidget):
 
 
 class SegmentationSettings(QWidget):
-    """ Container for gui settings. Validation is done automatically so any attributes can 
-    be acessed without concern.  
+    """ Container for gui settings. Validation is done automatically so any attributes can
+    be acessed without concern.
     """
     def __init__(self, font):
         super().__init__()
@@ -252,14 +252,14 @@ class SegmentationSettings(QWidget):
         ########################### Diameter ###########################
         # TODO: Validate inputs
         diam_qlabel = QLabel("diameter:")
-        diam_qlabel.setToolTip("diameter of cells in pixels. If not 30, image will be resized to this")
+        diam_qlabel.setToolTip("diameter of cells in pixels. If not 60, image will be resized to this")
         diam_qlabel.setFont(font)
         grid_layout.addWidget(diam_qlabel, row, 0, 1, 2)
         self.diameter_box = QLineEdit()
-        self.diameter_box.setToolTip("diameter of cells in pixels. If not blank, image will be resized relative to 30 pixel cell diameters")
+        self.diameter_box.setToolTip("diameter of cells in pixels. If not blank, image will be resized relative to 60 pixel cell diameters")
         self.diameter_box.setFont(font)
         self.diameter_box.setFixedWidth(40)
-        self.diameter_box.setText(' ')
+        self.diameter_box.setText('60')
         grid_layout.addWidget(self.diameter_box, row, 2, 1, 2)
 
         row += 1
@@ -271,12 +271,12 @@ class SegmentationSettings(QWidget):
         flow_threshold_qlabel.setFont(font)
         grid_layout.addWidget(flow_threshold_qlabel, row, 0, 1, 2)
         self.flow_threshold_box = QLineEdit()
-        self.flow_threshold_box.setText("0.4")
+        self.flow_threshold_box.setText("0.6")
         self.flow_threshold_box.setFixedWidth(40)
         self.flow_threshold_box.setFont(font)
         grid_layout.addWidget(self.flow_threshold_box, row, 2, 1, 2)
         self.flow_threshold_box.setToolTip("threshold on flow error to accept a mask (set higher to get more cells, e.g. in range from (0.1, 3.0), OR set to 0.0 to turn off so no cells discarded);\n press enter to recompute if model already run")
-        
+
         ########################### Cellprob threshold ###########################
         # TODO: Validate inputs
         cellprob_qlabel = QLabel("cellprob\nthreshold:")
@@ -284,7 +284,7 @@ class SegmentationSettings(QWidget):
         cellprob_qlabel.setFont(font)
         grid_layout.addWidget(cellprob_qlabel, row, 4, 1, 2)
         self.cellprob_threshold_box = QLineEdit()
-        self.cellprob_threshold_box.setText("0.0")
+        self.cellprob_threshold_box.setText("-0.5")
         self.cellprob_threshold_box.setFixedWidth(40)
         self.cellprob_threshold_box.setFont(font)
         self.cellprob_threshold_box.setToolTip("threshold on cellprob output to seed cell masks (set lower to include more pixels or higher to include fewer, e.g. in range from (-6, 6)); \n press enter to recompute if model already run")
@@ -349,7 +349,7 @@ class SegmentationSettings(QWidget):
     def validate_normalization_range(self):
         low_text = self.norm_percentile_low_box.text()
         high_text = self.norm_percentile_high_box.text()
-        
+
         if not low_text or low_text.isspace():
             self.norm_percentile_low_box.setText('1.0')
             low_text = '1.0'
@@ -377,7 +377,7 @@ class SegmentationSettings(QWidget):
             self.norm_percentile_low_box.setText('1.0')
             low_text = '1.0'
         return float(self.norm_percentile_low_box.text())
-    
+
     @property
     def high_percentile(self):
         """ Also validate the high input by returning 99.0 if text doesn't work """
@@ -386,7 +386,7 @@ class SegmentationSettings(QWidget):
             self.norm_percentile_high_box.setText('99.0')
             high_text = '99.0'
         return float(self.norm_percentile_high_box.text())
-    
+
     @property
     def diameter(self):
         """ Get the diameter from the diameter box, if box isn't a number return None"""
@@ -394,16 +394,16 @@ class SegmentationSettings(QWidget):
             d = float(self.diameter_box.text())
         except ValueError:
             d = None
-        return d 
-    
+        return d
+
     @property
     def flow_threshold(self):
         return float(self.flow_threshold_box.text())
-    
+
     @property
     def cellprob_threshold(self):
         return float(self.cellprob_threshold_box.text())
-    
+
     @property
     def niter(self):
         text = self.niter_box.text()
