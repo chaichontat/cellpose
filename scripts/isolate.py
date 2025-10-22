@@ -8,7 +8,6 @@ import os
 # Enforce GPU 1 usage for this script. With this mask, the process will see a
 # single logical device at index 0 that maps to physical GPU 1.
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
 import subprocess
 import sys
@@ -28,7 +27,7 @@ from cellpose.trt import CellposeModelTRT
 image_path = Path(os.environ.get("CP_ISO_IMAGE",
                       "/working/20251001_JaxA3_Coro11/analysis/deconv/registered--3r+pi/reg-0076.tif"))
 engine_path = Path(os.environ.get("CP_ISO_ENGINE",
-                      "/home/chaichontat/cellpose/scripts/builds/cyto2_bf16.plan"))  # must match checkpoint!
+                      "/home/chaichontat/cellpose/scripts/builds/cpsam_b4_sm120_bf16_opt3.plan"))  # must match checkpoint!
 onnx_path   = Path(os.environ.get("CP_ISO_ONNX",
                       "/home/chaichontat/cellpose/scripts/builds/cyto2.onnx"))
 pretrained  = os.environ.get("CP_ISO_CKPT",
@@ -282,40 +281,6 @@ print("  TRT out 'style'   :", s_shape_e)
 print("  TRT dtypes        : in=", trt_direct.dt_in, " y=", trt_direct.dt_y, " s=", trt_direct.dt_s)
 
 if not TRT_ONLY:
-    with torch.inference_mode():
-        X_probe = torch.randn(N, C, H, W, device=device, dtype=dtype)
-        y_pt, s_pt = base.net.net(X_probe)[:2]
-    print("  Torch out 'y' shape:", tuple(y_pt.shape))
-    print("  Torch out 'style'  :", tuple(s_pt.shape))
-
-if not TRT_ONLY:
-    # ---- TEST A: net-only parity on random input ----
-    torch.manual_seed(0)
-    with torch.inference_mode():
-        X = torch.randn(N, C, H, W, device=device, dtype=dtype)
-        y_t, s_t = base.net.net(X)[:2]
-        y_r, s_r = trt_direct(X)
-
-    print("\n[TEST A] Random-input net parity (Torch vs TRT-engine)")
-    summarize("y (random)", y_t, y_r)
-    summarize("style (rand)", s_t, s_r)
-    if torch.tensor(y_t).isnan().any() or torch.tensor(y_r).isnan().any():
-        print("NaNs detected in y — check normalization / Resize attrs.")
-
-    # Timing (net-only)
-    with torch.inference_mode():
-        _torch_fn = lambda: base.net.net(X)
-        _trt_fn_d = lambda: trt_direct(X)
-        _trt_fn_w = lambda: trt_model.net.net(X)
-        print("\n[TIMING A] Net-only forward on random input")
-        ms_torch = time_op("  Torch net", _torch_fn, device=device)
-        ms_trt_d = time_op("  TRT direct", _trt_fn_d, device=device)
-        ms_trt_w = time_op("  TRT wrapped", _trt_fn_w, device=device)
-        spd_d = ms_torch / ms_trt_d if ms_trt_d > 0 else float('inf')
-        spd_w = ms_torch / ms_trt_w if ms_trt_w > 0 else float('inf')
-        print(f"  Speedup vs Torch: direct x{spd_d:.2f}, wrapped x{spd_w:.2f}")
-
-if not TRT_ONLY:
     # ---- TEST B: captured-input parity from eval() (compute_masks=False) ----
     with torch.inference_mode():
         # use the same batch size for parity
@@ -326,6 +291,12 @@ if not TRT_ONLY:
 
     calls_pt  = base.net.calls
     calls_trt = trt_model.net.calls
+
+    if calls_pt:
+        y_pt_shape = tuple(calls_pt[0]["outputs"][0].shape)
+        s_pt_shape = tuple(calls_pt[0]["outputs"][1].shape)
+        print("  Torch out 'y' shape:", y_pt_shape)
+        print("  Torch out 'style'  :", s_pt_shape)
 
     print(f"\n[TEST B] Captured .net calls: torch={len(calls_pt)} trt={len(calls_trt)}")
     num_calls = min(len(calls_pt), len(calls_trt))

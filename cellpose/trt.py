@@ -192,5 +192,5 @@ class CellposeModelTRT(models.CellposeModel):
             raise ValueError(f"Unsupported backend: {backend}")
 
     def eval(self, *args, **kwargs):
-        kwargs |= {"batch_size": 1}  # TRT engine built for batch size 1
+        kwargs |= {"batch_size": 4}  # TRT engine built for batch size 1
         return super().eval(*args, **kwargs)
