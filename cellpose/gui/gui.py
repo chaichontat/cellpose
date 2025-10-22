@@ -17,6 +17,7 @@ from scipy.stats import mode
 import cv2
 
 from . import guiparts, menus, io
+from .diffcache import DiffStateCache
 from .. import models, core, dynamics, version, train
 from ..utils import download_url_to_file, masks_to_outlines, diameters
 from ..io import get_image_files, imsave, imread
@@ -534,6 +535,7 @@ class MainW(QMainWindow):
         self.maskToggleButton.clicked.connect(self.toggle_mask_restore)
         self.segBoxG.addWidget(self.maskToggleButton, widget_row, 3, 1, 3)
 
+        self._diff_state_cache = DiffStateCache()
         self._diff_fig = None
         self._diff_ax = None
         self._diff_img_im = None
@@ -935,6 +937,92 @@ class MainW(QMainWindow):
                 self.maskToggleButton.setText("reset mask")
                 base_tip = "Show saved _seg.npy segmentation"
             self.maskToggleButton.setToolTip(base_tip if can_reset else reset_tip)
+
+    def _diff_cache_key(self, filename=None):
+        path = filename if filename is not None else getattr(self, "filename", None)
+        if isinstance(path, str) and path:
+            try:
+                return os.path.abspath(path)
+            except Exception:
+                return path
+        return None
+
+    def _diff_cache_before_image_change(self):
+        cache = getattr(self, "_diff_state_cache", None)
+        if cache is None:
+            return
+        key = self._diff_cache_key()
+        if key is None:
+            return
+        state_new = getattr(self, "_diff_state_new", None)
+        has_masks = isinstance(state_new, dict) and state_new.get("masks") is not None
+        if not has_masks:
+            cache.discard(key)
+            return
+        latest_masks = self._diff_latest_masks if isinstance(self._diff_latest_masks, np.ndarray) else None
+        active_state = state_new if not self._diff_showing_restored else self._diff_get_saved_state(reload=False)
+        cache.store(
+            key,
+            new_state=state_new,
+            latest_masks=latest_masks,
+            active_state=active_state,
+            showing_restored=self._diff_showing_restored,
+            crosshair=self._diff_last_crosshair,
+            z_index=self._diff_z_index,
+            last_shape=self._diff_last_shape,
+        )
+
+    def _diff_restore_after_image_load(self):
+        cache = getattr(self, "_diff_state_cache", None)
+        if cache is None:
+            self._diff_update_button_state()
+            return
+        key = self._diff_cache_key()
+        entry = cache.retrieve(key)
+        if not entry:
+            self._diff_update_button_state()
+            return
+        showing_restored = bool(entry.get("showing_restored", False))
+        new_state = entry.get("new_state")
+        active_state = entry.get("active_state")
+        latest_masks = entry.get("latest_masks")
+        crosshair = entry.get("crosshair")
+        z_index = entry.get("z_index")
+        last_shape = entry.get("last_shape")
+        try:
+            if showing_restored:
+                if active_state is not None:
+                    self._diff_apply_state(active_state, treat_as_new=False)
+                else:
+                    state_old = self._diff_get_saved_state(reload=True)
+                    if state_old is not None:
+                        self._diff_apply_state(state_old, treat_as_new=False)
+                self._diff_state_new = new_state
+                if isinstance(latest_masks, np.ndarray):
+                    self._diff_latest_masks = np.array(latest_masks, copy=True)
+                elif isinstance(new_state, dict) and new_state.get("masks") is not None:
+                    self._diff_latest_masks = np.array(new_state["masks"], copy=True)
+                else:
+                    self._diff_latest_masks = None
+            else:
+                if active_state is None:
+                    active_state = new_state
+                if active_state is not None:
+                    self._diff_apply_state(active_state, treat_as_new=True)
+                else:
+                    self._diff_state_new = None
+                    self._diff_latest_masks = None
+            self._diff_showing_restored = showing_restored
+            self._diff_last_crosshair = tuple(crosshair) if crosshair is not None else None
+            self._diff_last_shape = last_shape
+            self._diff_z_index = z_index
+            if self._diff_last_crosshair is not None:
+                self._diff_update_crosshair_lines(self._diff_last_crosshair)
+        except Exception as exc:
+            print(f"GUI_WARNING: failed to restore diff state for {key}: {exc}")
+            cache.discard(key)
+        finally:
+            self._diff_update_button_state()
 
     def get_crosshair_coords(self):
         return self._diff_last_crosshair
@@ -1823,10 +1911,15 @@ class MainW(QMainWindow):
 
     def dropEvent(self, event):
         files = [u.toLocalFile() for u in event.mimeData().urls()]
-        if os.path.splitext(files[0])[-1] == ".npy":
-            io._load_seg(self, filename=files[0], load_3D=self.load_3D)
+        target_file = files[0]
+        if os.path.splitext(target_file)[-1] == ".npy":
+            paired_image = io.resolve_seg_drop_target(target_file)
+            if paired_image:
+                io._load_image(self, filename=paired_image, load_seg=True, load_3D=self.load_3D)
+            else:
+                io._load_seg(self, filename=target_file, load_3D=self.load_3D)
         else:
-            io._load_image(self, filename=files[0], load_seg=True, load_3D=self.load_3D)
+            io._load_image(self, filename=target_file, load_seg=True, load_3D=self.load_3D)
 
     def toggle_masks(self):
         if self.MCheckBox.isChecked():
