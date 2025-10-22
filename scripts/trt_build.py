@@ -1,3 +1,39 @@
+"""Builds a TensorRT engine (.plan) from a Cellpose model.
+
+Speed up of 1.7x (batch size 4) - 2.2x (batch size 1) observed for
+CellposeSAM net on RTX 5090 with BF16 engine
+compared to the native PyTorch bfloat16 inference.
+
+Requirements
+- NVIDIA GPU with BF16 support (SM80+, e.g., Ampere or newer).
+- TensorRT >= 10 (Python bindings with the tensors API).
+- PyTorch with ONNX exporter.
+- CellposeSAM bfloat16 weights (pretrained_model path).
+
+Dependencies can be installed via pip:
+  `pip install tensorrt-cu12 nvidia-cuda-runtime-cu12`
+
+Ensure that the requested CUDA version matches the CUDA version of your environment.
+
+Behavior
+- Exports ONNX that returns exactly (y, style), matching Cellpose segmentation.
+- Fixed optimization profile: N=batch-size, C=3, H=W=bsize.
+- BF16 engine with builder_optimization_level=3 and OBEY_PRECISION_CONSTRAINTS.
+
+Gotchas
+- Plan files are not portable: they are specific to GPU arch (SM) and
+  TensorRT/CUDA/driver. Rebuild on each host/GPU family;
+- Tensor size is fixed, bsize and batch_size must be specified and the same at runtime.
+
+Usage
+  python build-trt.py PRETRAINED -o OUTPUT.plan [--batch-size N] [--bsize 256] [--vram 12000] [--opset 18]
+
+Runs in ~2 minutes on a Threadripper 7990X with RTX 5090
+Tested on tensorrt-cu12 10.13.3.9, torch 2.9.0+cu128, Python 3.13.9
+NVIDIA open driver 570.195.03, Ubuntu 24.04.2
+
+"""
+
 import argparse
 import os
 from pathlib import Path
@@ -35,11 +71,6 @@ def export_onnx(pretrained_model: str, onnx_out: str, *, batch_size: int, bsize:
     wrapper = _CPNetWrapper(net)
 
     dummy = torch.randn(batch_size, 3, bsize, bsize, device=device, dtype=torch.bfloat16)
-    dynamic_axes = {
-        "input": {0: "N", 2: "H", 3: "W"},
-        "y": {0: "N", 2: "H", 3: "W"},
-        "style": {0: "N"},
-    }
     Path(os.path.dirname(onnx_out) or ".").mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
         torch.onnx.export(
@@ -47,10 +78,9 @@ def export_onnx(pretrained_model: str, onnx_out: str, *, batch_size: int, bsize:
             dummy,
             onnx_out,
             opset_version=opset,
-            dynamo=True,
+            dynamo=False,
             input_names=["input"],
             output_names=["y", "style"],
-            dynamic_axes=dynamic_axes,
         )
     print(f"Exported ONNX to {onnx_out}.")
 
@@ -75,7 +105,7 @@ def build_engine(onnx_path: str, plan_path: str, *, bsize: int, vram: int, batch
         raise RuntimeError(f"Failed to parse ONNX file {onnx_path}")
 
     config = builder.create_builder_config()
-    config.builder_optimization_level = 4
+    config.builder_optimization_level = 3  # 4 doesn't help, 5 is too slow
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, vram * (1 << 20))
     config.set_flag(trt.BuilderFlag.BF16)
     config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
@@ -101,7 +131,9 @@ def build_engine(onnx_path: str, plan_path: str, *, bsize: int, vram: int, batch
     data = _to_bytes(engine_blob)
     if not data:
         raise RuntimeError("TensorRT engine build failed or returned empty blob.")
-    Path(plan_path).mkdir(parents=True, exist_ok=True)
+
+    out_dir = Path(plan_path).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
     with open(plan_path, "wb") as f:
         f.write(data)
     print(f"Saved TensorRT engine: {plan_path} (shape {fixed}, dtype=bf16)")
@@ -112,7 +144,7 @@ def main():
     ap.add_argument("pretrained_model", type=str, help="Path/name of pretrained model (e.g., cpsam)")
     ap.add_argument("-o", "--output", type=str, required=True, help="TensorRT engine output path (.plan)")
     ap.add_argument("--vram", type=int, default=12000, help="Amount of GPU memory available (in MB) for TensorRT to optimize for")
-    ap.add_argument("--batch-size", type=int, default=4, help="Fixed batch dimension N")
+    ap.add_argument("--batch-size", type=int, default=1, help="Fixed batch dimension N")
     ap.add_argument("--bsize", type=int, default=256, help="Tile size (256x256 by default)")
     ap.add_argument("--opset", type=int, default=18, help="ONNX opset version to use for export")
     args = ap.parse_args()

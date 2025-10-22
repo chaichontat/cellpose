@@ -11,21 +11,14 @@ def _torch_ptr(t: torch.Tensor):
 
 
 class TRTEngineModule(torch.nn.Module):
-    """TensorRT-backed Cellpose head for main segmentation workflow.
+    """TensorRT-backed CellposeSAM model.
 
-    Contract
-    - forward(X) returns exactly two tensors: (y, style)
-      * y: [N, 3, H, W] with channels [dY, dX, cellprob]
-      * style: [N, 256]
-    - This matches Cellpose's primary segmentation path and core.run_net/_forward,
-      which slice net(X)[:2]. It is not intended for auxiliary training/export
-      variants that add extra outputs (e.g., BioImage.IO downsampled tensors,
-      denoise/perceptual losses).
+    It is not intended for auxiliary training/export variants that add extra outputs
+    (e.g., BioImage.IO downsampled tensors, denoise/perceptual losses).
 
     Notes
-    - Requires NVIDIA CUDA and TensorRT >= 10 (tensors API).
-    - Engines are compiled for fixed profiles; batching/shape flexibility must
-      be handled at a higher level if needed.
+    - Requires TensorRT >= 10.
+    - Engines are compiled for fixed profiles batch size and tile size.
     """
     def __init__(self, engine_path: str, device=torch.device("cuda")):
         super().__init__()
@@ -36,7 +29,6 @@ class TRTEngineModule(torch.nn.Module):
                 f"TensorRT backend requires a CUDA device, got '{self.device.type}'. CPUs/MLX are unsupported."
             )
 
-        # Simple, reliable version check: use TensorRT's __version__
         ver = getattr(trt, "__version__", None)
         if not ver:
             raise RuntimeError("TensorRT >= 10 required (version unknown).")
@@ -118,14 +110,18 @@ class TRTEngineModule(torch.nn.Module):
 
 
 class CellposeModelTRT(models.CellposeModel):
-    """
-    Drop-in subclass for the main segmentation workflow (eval) using TensorRT.
+    """Drop-in replacement for CellposeModel (eval) using TensorRT.
 
+    Preparation
+    - Build an engine for your model first with scripts/build-trt.py, for example:
+      python scripts/build-trt.py PRETRAINED -o OUTPUT.plan --batch-size 4 --bsize 256
+      Then pass engine_path=OUTPUT.plan to this class.
+
+    Contract
     - Uses a TensorRT engine whose forward returns exactly (y, style) as defined
-      in TRTEngineModule. This aligns with Cellpose's segmentation pipeline.
+      in TRTEngineModule; aligns with the main segmentation pipeline.
     - Not intended for denoise/perceptual-loss training utilities or BioImage.IO
       export paths that expect additional tensors beyond (y, style).
-
     """
 
     def __init__(
