@@ -96,6 +96,7 @@ class MainW_ortho2D(MainW):
         self.zc_ortho = 0       # Z index of the main plane within stack_ortho
         self.dz = 10            # Number of Z planes to show above/below main plane in ortho views
         self.zaspect = 6.0      # Z-aspect ratio for ortho views
+        self._ortho_seg_warned = False  # Track whether we've logged segmentation alignment warnings
 
         # MainW expects a resample control when handling 3D flows; default to True so
         # downstream logic that checks self.resample works even without a checkbox.
@@ -182,20 +183,25 @@ class MainW_ortho2D(MainW):
         files = [u.toLocalFile() for u in event.mimeData().urls()]
         if not files:
             return
-        ext = os.path.splitext(files[0])[1].lower()
+        target = files[0]
+        ext = os.path.splitext(target)[1].lower()
         if ext == ".npy":
-            msg = (
-                "Ortho viewer does not accept .npy segmentation files. "
-                "Use the standard GUI to load segmentations, or drop an image file."
-            )
-            print(f"GUI_ERROR: {msg}")
-            try:
-                QMessageBox.critical(self, "Unsupported file", msg)
-            except Exception:
-                pass
-            return
+            paired_image = io.resolve_seg_drop_target(target)
+            if paired_image:
+                target = paired_image
+            else:
+                msg = (
+                    "Ortho viewer does not accept .npy segmentation files. "
+                    "Use the standard GUI to load segmentations, or drop an image file."
+                )
+                print(f"GUI_ERROR: {msg}")
+                try:
+                    QMessageBox.critical(self, "Unsupported file", msg)
+                except Exception:
+                    pass
+                return
         print(files)
-        self._load_image_ortho2D(filename=files[0], load_seg=True)
+        self._load_image_ortho2D(filename=target, load_seg=True)
 
     def _load_image(self, filename=None, load_seg=True):
         """ Override base _load_image to call the ortho version. """
@@ -242,6 +248,7 @@ class MainW_ortho2D(MainW):
         self.stack_ortho = None
         self.ortho_nz = 0
         self.zc_ortho = 0
+        self._ortho_seg_warned = False
 
         try:
             from pathlib import Path
@@ -673,6 +680,131 @@ class MainW_ortho2D(MainW):
             np.zeros((self.Ly, zrange, 4), "uint8"),
             np.zeros((zrange, self.Lx, 4), "uint8")
         ]
+
+        cellpix = getattr(self, "cellpix", None)
+        outpix = getattr(self, "outpix", None)
+        masks_available = (
+            getattr(self, "masksOn", False)
+            and isinstance(cellpix, np.ndarray)
+            and cellpix.ndim == 3
+            and cellpix.size > 0
+        )
+        outlines_available = (
+            getattr(self, "outlinesOn", False)
+            and isinstance(outpix, np.ndarray)
+            and outpix.ndim == 3
+            and outpix.size > 0
+        )
+
+        if masks_available or outlines_available:
+            window_width = max(0, local_to_excl - local_from)
+            if window_width > 0:
+                cp_sections = [None, None]
+                op_sections = [None, None]
+
+                if masks_available:
+                    cp_sections = [
+                        np.zeros((self.Ly, zrange), dtype=cellpix.dtype),
+                        np.zeros((zrange, self.Lx), dtype=cellpix.dtype),
+                    ]
+                if outlines_available:
+                    op_sections = [
+                        np.zeros((self.Ly, zrange), dtype=outpix.dtype),
+                        np.zeros((zrange, self.Lx), dtype=outpix.dtype),
+                    ]
+
+                ortho_indices = getattr(self, "ortho_used_z_indices", None)
+                if isinstance(ortho_indices, np.ndarray):
+                    ortho_indices = ortho_indices.tolist()
+                ortho_len = len(ortho_indices) if isinstance(ortho_indices, (list, tuple)) else 0
+                center_abs = None
+                if ortho_len and 0 <= self.zc_ortho < ortho_len:
+                    center_abs = ortho_indices[self.zc_ortho]
+
+                def resolve_seg_index(z_abs: int):
+                    if getattr(self, "NZ", 0) <= 0:
+                        return None
+                    base_idx = int(getattr(self, "currentZ", 0))
+                    seg_idx = None
+                    if ortho_len and center_abs is not None and 0 <= z_abs < ortho_len:
+                        target_abs = ortho_indices[z_abs]
+                        seg_idx = base_idx + (target_abs - center_abs)
+                    else:
+                        seg_idx = base_idx + (z_abs - self.zc_ortho)
+                    if 0 <= seg_idx < self.NZ:
+                        return int(seg_idx)
+                    if not self._ortho_seg_warned:
+                        print(f"GUI_WARNING: Ortho overlay skipped (no segmentation slice for z index {z_abs}).")
+                        self._ortho_seg_warned = True
+                    return None
+
+                # Populate cross-sections for masks/outlines
+                for k in range(local_from, local_to_excl):
+                    z_abs = zi_start + k
+                    seg_idx = resolve_seg_index(z_abs)
+                    if seg_idx is None:
+                        continue
+                    if masks_available and seg_idx < cellpix.shape[0]:
+                        if 0 <= x < cellpix.shape[2]:
+                            cp_sections[0][:, k] = cellpix[seg_idx, :, x]
+                        if 0 <= y < cellpix.shape[1]:
+                            cp_sections[1][k, :] = cellpix[seg_idx, y, :]
+                    if outlines_available and seg_idx < outpix.shape[0]:
+                        if 0 <= x < outpix.shape[2]:
+                            op_sections[0][:, k] = outpix[seg_idx, :, x]
+                        if 0 <= y < outpix.shape[1]:
+                            op_sections[1][k, :] = outpix[seg_idx, y, :]
+
+                if masks_available:
+                    cellcolors = np.asarray(self.cellcolors, dtype=np.uint8)
+                    selected_idx = int(getattr(self, "selected", 0))
+                    opacity_val = int(np.clip(getattr(self, "opacity", 0), 0, 255))
+                    z_slice = slice(local_from, local_to_excl)
+                    for j, cp_slice in enumerate(cp_sections):
+                        if cp_slice is None:
+                            continue
+                        cp_safe = cp_slice.copy()
+                        if cellcolors.shape[0] == 0:
+                            cp_safe[:] = 0
+                        else:
+                            too_large = cp_safe >= cellcolors.shape[0]
+                            if np.any(too_large):
+                                cp_safe[too_large] = 0
+                        if j == 0:
+                            cp_segment = cp_safe[:, z_slice]
+                            if cp_segment.size > 0:
+                                layer_view = self.layer_ortho[j][:, z_slice]
+                                layer_view[..., :3] = cellcolors[cp_segment, :]
+                                alpha_block = (opacity_val * (cp_segment > 0).astype(np.uint8)).astype(np.uint8)
+                                layer_view[..., 3] = alpha_block
+                                if selected_idx > 0:
+                                    sel_mask = cp_segment == selected_idx
+                                    if np.any(sel_mask):
+                                        layer_view[sel_mask] = np.array(
+                                            [255, 255, 255, opacity_val], dtype=np.uint8
+                                        )
+                        else:
+                            cp_segment = cp_safe[z_slice, :]
+                            if cp_segment.size > 0:
+                                layer_view = self.layer_ortho[j][z_slice, :]
+                                layer_view[..., :3] = cellcolors[cp_segment, :]
+                                alpha_block = (opacity_val * (cp_segment > 0).astype(np.uint8)).astype(np.uint8)
+                                layer_view[..., 3] = alpha_block
+                                if selected_idx > 0:
+                                    sel_mask = cp_segment == selected_idx
+                                    if np.any(sel_mask):
+                                        layer_view[sel_mask] = np.array(
+                                            [255, 255, 255, opacity_val], dtype=np.uint8
+                                        )
+
+                if outlines_available:
+                    outline_rgba = np.array(self.outcolor, dtype=np.uint8)
+                    for j, op_slice in enumerate(op_sections):
+                        if op_slice is None:
+                            continue
+                        outline_mask = op_slice > 0
+                        if np.any(outline_mask):
+                            self.layer_ortho[j][outline_mask] = outline_rgba
 
         for j in range(2):
             self.layerOrtho[j].setImage(self.layer_ortho[j])
