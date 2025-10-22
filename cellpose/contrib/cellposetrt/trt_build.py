@@ -63,9 +63,9 @@ import argparse
 import os
 from pathlib import Path
 
+import tensorrt as trt
 import torch
 
-import tensorrt as trt
 from cellpose import models
 
 
@@ -165,7 +165,7 @@ def main():
     ap.add_argument("--vram", type=int, default=12000, help="Amount of GPU memory available (in MB) for TensorRT to optimize for")
     ap.add_argument("--batch-size", type=int, default=1, help="Fixed batch dimension N")
     ap.add_argument("--bsize", type=int, default=256, help="Tile size (256x256 by default)")
-    ap.add_argument("--opset", type=int, default=18, help="ONNX opset version to use for export")
+    ap.add_argument("--opset", type=int, default=20, help="ONNX opset version to use for export")
     args = ap.parse_args()
 
     plan_path = args.output
