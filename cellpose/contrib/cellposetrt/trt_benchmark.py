@@ -18,7 +18,7 @@ import tifffile
 import torch
 
 from cellpose import models
-from cellpose.contrib.tensorrt import CellposeModelTRT
+from cellpose.contrib.cellposetrt import CellposeModelTRT
 
 # ---- CONFIG ----
 image_path = Path(

@@ -1,10 +1,23 @@
-"""TensorRT-backed Cellpose model module."""
+"""TensorRT-backed Cellpose model module.
+
+  TensorRT is NVIDIA's neural‑network inference compiler/runtime for NVIDIA GPUs. It takes
+  an ONNX/graph, picks optimized kernels, fuses layers, and plans memory/scheduling
+  specialized for a given GPU architecture and fixed input profile.
+
+  By specializing for fixed input shapes and fusing ops, TensorRT can deliver
+  higher performance than standard PyTorch inference (1.7x speedup in RTX 5090).
+  A CellposeSAM model can be converted to the TensorRT format by running
+  cellpose/contrib/cellposetrt/trt_build.py.
+
+  `CellposeModelTRT(engine_path=...)` in this module is a drop-in replacement for
+  the standard `CellposeModel` to run CellposeSAM via TensorRT.
+"""
 
 import ctypes
 
+import tensorrt as trt
 import torch
 
-import tensorrt as trt
 from cellpose import models
 
 
