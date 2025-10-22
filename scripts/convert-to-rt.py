@@ -9,7 +9,7 @@ from typing import Tuple
 import tensorrt as trt
 import torch
 
-DEFAULT_HW: Tuple[int, int] = (256, 256)  # Hardcoded per user request
+DEFAULT_HW: tuple[int, int] = (256, 256)  # Hardcoded per user request
 
 def _to_bytes(obj) -> bytes:
     if obj is None:
@@ -64,8 +64,6 @@ def build_engine(onnx_path: str, plan_path: str, hw: Tuple[int, int], workspace_
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_mb * (1 << 20))
     config.set_flag(trt.BuilderFlag.BF16)
     config.builder_optimization_level = 3
-
-    # Re-enable OBEY_PRECISION_CONSTRAINTS to tighten numeric parity
     config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
     # Conservative tactics: restrict to cuBLAS/cuBLAS_LT/cuDNN (no Cask)
     mask = 0
@@ -78,6 +76,7 @@ def build_engine(onnx_path: str, plan_path: str, hw: Tuple[int, int], workspace_
     if inp.shape is None or len(inp.shape) != 4:
         raise ValueError(f"Expected NCHW input, got {inp.shape}")
     _, C_dim, _, _ = tuple(inp.shape)
+
     if not isinstance(C_dim, int) or C_dim <= 0:
         raise ValueError(f"Channel dimension must be static/int in ONNX, got {C_dim}")
     C = C_dim

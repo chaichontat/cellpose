@@ -25,18 +25,12 @@ def main():
     p.add_argument('--opset', type=int, default=18)
     p.add_argument('--onnx', type=str, required=True)
     p.add_argument('--opt_hw', type=int, nargs=2, default=[256,256], help='Export resolution H W (used for dummy input)')
-    p.add_argument('--batch', type=int, default=4)
-    # Precision policy: model MUST be BF16. Raise if FP32 is requested or detected.
+    p.add_argument('--batch', type=int, default=1)
     args = p.parse_args()
-
-    print(args.pretrained_model)
     device = torch.device('cuda' if args.gpu else 'cpu')
-    if args.fp32:
-        raise RuntimeError("This export enforces BF16. Do not pass --fp32.")
     model = models.CellposeModel(gpu=args.gpu, pretrained_model=args.pretrained_model,
                                  use_bfloat16=True)
     net = model.net.to(device)
-    # Enforce BF16 weights strictly; fail fast if FP32 detected
     param_dtypes = {p.dtype for p in net.parameters()}
     if torch.float32 in param_dtypes:
         raise RuntimeError(f"Loaded model contains FP32 parameters: {param_dtypes}. Expected BF16 only.")
@@ -55,22 +49,18 @@ def main():
     dynamic_axes = {
         'input':  {0:'N', 2:'H', 3:'W'},
         'y':      {0:'N', 2:'H', 3:'W'},
-        'style':  {0:'N'}
+        'style':  {0:'N'}  # second dim (style) is static
     }
 
     os.makedirs(os.path.dirname(args.onnx) or '.', exist_ok=True)
     with torch.no_grad():
         torch.onnx.export(
-            wrapper,
-            dummy,
-            args.onnx,
-            opset_version=args.opset,
+            wrapper, dummy, args.onnx, opset_version=args.opset,
             dynamo=True,
-            input_names=['input'],
-            output_names=['y','style'],
+            input_names=['input'], output_names=['y','style'],
             dynamic_axes=dynamic_axes
         )
-    print(f"Exported ONNX to {args.onnx} (dtype={'bf16' if target_dtype==torch.bfloat16 else 'fp32'})")
+    print(f"Exported ONNX to {args.onnx}.")
     print(f"Assumed nchan={nchan}, dynamic N,H,W; batch={args.batch}")
 
 if __name__ == '__main__':
