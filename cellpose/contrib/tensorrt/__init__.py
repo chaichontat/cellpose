@@ -1,8 +1,10 @@
+"""TensorRT-backed Cellpose model module."""
+
 import ctypes
 
-import tensorrt as trt
 import torch
 
+import tensorrt as trt
 from cellpose import models
 
 
@@ -113,8 +115,8 @@ class CellposeModelTRT(models.CellposeModel):
     """Drop-in replacement for CellposeModel (eval) using TensorRT.
 
     Preparation
-    - Build an engine for your model first with scripts/build-trt.py, for example:
-      python scripts/build-trt.py PRETRAINED -o OUTPUT.plan --batch-size 4 --bsize 256
+    - Build an engine for your model first with scripts/trt_build.py, for example:
+      python scripts/trt_build.py PRETRAINED -o OUTPUT.plan --batch-size 4 --bsize 256
       Then pass engine_path=OUTPUT.plan to this class.
 
     Contract

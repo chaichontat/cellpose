@@ -12,8 +12,7 @@ Requirements
 
 Dependencies can be installed via pip:
   `pip install tensorrt-cu12 nvidia-cuda-runtime-cu12`
-
-Ensure that the requested CUDA version matches the CUDA version of your environment.
+Ensure that the requested CUDA version matches your environment's CUDA version.
 
 Behavior
 - Exports ONNX that returns exactly (y, style), matching Cellpose segmentation.
@@ -26,21 +25,47 @@ Gotchas
 - Tensor size is fixed, bsize and batch_size must be specified and the same at runtime.
 
 Usage
-  python build-trt.py PRETRAINED -o OUTPUT.plan [--batch-size N] [--bsize 256] [--vram 12000] [--opset 18]
+  python trt_build.py PRETRAINED -o OUTPUT.plan [--batch-size N] [--bsize 256] [--vram 12000] [--opset 18]
 
 Runs in ~2 minutes on a Threadripper 7990X with RTX 5090
 Tested on tensorrt-cu12 10.13.3.9, torch 2.9.0+cu128, Python 3.13.9
 NVIDIA open driver 570.195.03, Ubuntu 24.04.2
 
+Example output:
+    Loaded tile: (2, 512, 512) uint16
+    Engine path: /home/chaichontat/cellpose/scripts/builds/cpsam_b4_sm120_bf16.plan
+    Using CUDA device: cuda:0 | NVIDIA GeForce RTX 5090
+
+    [TEST C] Full pipeline parity
+    masks: torch=(512, 512) trt=(512, 512)  IoU=0.9986
+    flow[0]: shape=(512, 512, 3) | sMAPE=2.257%  MAE=0.176858
+    flow[1]: shape=(2, 512, 512) | sMAPE=27.623%  MAE=0.0060048
+    flow[2]: shape=(512, 512) | sMAPE=0.816%  MAE=0.0170394
+
+    [TIMING C] Full pipeline eval(tile3)
+    Torch eval: 222.155 ms/iter (avg over 5, warmup=1)
+    TRT eval: 138.330 ms/iter (avg over 5, warmup=1)
+    Speedup vs Torch: x1.61
+
+    [TIMING D] Net-only forward (1x3x256x256)
+    Torch net: 15.930 ms/iter (CUDA events, iters=100, warmup=10)
+    TRT net  : 7.110 ms/iter (CUDA events, iters=100, warmup=10)
+    Speedup (net-only): x2.24
+
+    [TEST E] IoU parity on first 20 images from: /working/20251001_JaxA3_Coro11/analysis/deconv/registered--3r+pi
+    1/20 processed... IoU=0.9994
+    ...
+    20/20 processed... IoU=0.9991
+    IoU range: min=0.9816  median=0.9973  max=0.9996  (N=20)
 """
 
 import argparse
 import os
 from pathlib import Path
 
-import tensorrt as trt
 import torch
 
+import tensorrt as trt
 from cellpose import models
 
 
@@ -85,12 +110,6 @@ def export_onnx(pretrained_model: str, onnx_out: str, *, batch_size: int, bsize:
     print(f"Exported ONNX to {onnx_out}.")
 
 
-def _to_bytes(blob) -> bytes:
-    if blob is None:
-        return b""
-    return bytes(blob)
-
-
 def build_engine(onnx_path: str, plan_path: str, *, bsize: int, vram: int, batch_size: int):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to build a TensorRT engine.")
@@ -128,9 +147,9 @@ def build_engine(onnx_path: str, plan_path: str, *, bsize: int, vram: int, batch
     config.add_optimization_profile(profile)
 
     engine_blob = builder.build_serialized_network(network, config)
-    data = _to_bytes(engine_blob)
-    if not data:
+    if engine_blob is None:
         raise RuntimeError("TensorRT engine build failed or returned empty blob.")
+    data = bytes(engine_blob)
 
     out_dir = Path(plan_path).parent
     out_dir.mkdir(parents=True, exist_ok=True)

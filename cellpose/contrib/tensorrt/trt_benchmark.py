@@ -18,7 +18,7 @@ import tifffile
 import torch
 
 from cellpose import models
-from cellpose.trt import CellposeModelTRT
+from cellpose.contrib.tensorrt import CellposeModelTRT
 
 # ---- CONFIG ----
 image_path = Path(
@@ -36,7 +36,7 @@ pretrained = os.environ.get(
     "/working/cellpose-training/models/embryonicsam",
 )
 
-# TensorRT engine path processed from build-trt.py; must match above!
+# TensorRT engine path processed from trt_build.py; must match above!
 engine_path = Path(
     os.environ.get(
         "CP_ENGINE",
