@@ -24,11 +24,9 @@ def main():
     p.add_argument('--gpu', action='store_true')
     p.add_argument('--opset', type=int, default=18)
     p.add_argument('--onnx', type=str, required=True)
-    # Only use opt_hw (export shape); min/max removed
     p.add_argument('--opt_hw', type=int, nargs=2, default=[256,256], help='Export resolution H W (used for dummy input)')
-    p.add_argument('--batch', type=int, default=1)
+    p.add_argument('--batch', type=int, default=4)
     # Precision policy: model MUST be BF16. Raise if FP32 is requested or detected.
-    p.add_argument('--fp32', action='store_true', help='(Forbidden) Export in float32 — will raise')
     args = p.parse_args()
 
     print(args.pretrained_model)
@@ -57,15 +55,19 @@ def main():
     dynamic_axes = {
         'input':  {0:'N', 2:'H', 3:'W'},
         'y':      {0:'N', 2:'H', 3:'W'},
-        'style':  {0:'N'}  # second dim (style) is static
+        'style':  {0:'N'}
     }
 
     os.makedirs(os.path.dirname(args.onnx) or '.', exist_ok=True)
     with torch.no_grad():
         torch.onnx.export(
-            wrapper, dummy, args.onnx, opset_version=args.opset,
-            dynamo=False,
-            input_names=['input'], output_names=['y','style'],
+            wrapper,
+            dummy,
+            args.onnx,
+            opset_version=args.opset,
+            dynamo=True,
+            input_names=['input'],
+            output_names=['y','style'],
             dynamic_axes=dynamic_axes
         )
     print(f"Exported ONNX to {args.onnx} (dtype={'bf16' if target_dtype==torch.bfloat16 else 'fp32'})")
