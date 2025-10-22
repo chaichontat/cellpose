@@ -6,53 +6,51 @@ import torch
 from cellpose import models
 
 
-def _torch_ptr(t: torch.Tensor) -> int:
+def _torch_ptr(t: torch.Tensor):
     return ctypes.c_void_p(t.data_ptr()).value
 
 
 class TRTEngineModule(torch.nn.Module):
+    """TensorRT-backed Cellpose head for main segmentation workflow.
+
+    Contract
+    - forward(X) returns exactly two tensors: (y, style)
+      * y: [N, 3, H, W] with channels [dY, dX, cellprob]
+      * style: [N, 256]
+    - This matches Cellpose's primary segmentation path and core.run_net/_forward,
+      which slice net(X)[:2]. It is not intended for auxiliary training/export
+      variants that add extra outputs (e.g., BioImage.IO downsampled tensors,
+      denoise/perceptual losses).
+
+    Notes
+    - Requires NVIDIA CUDA and TensorRT >= 10 (tensors API).
+    - Engines are compiled for fixed profiles; batching/shape flexibility must
+      be handled at a higher level if needed.
+    """
     def __init__(self, engine_path: str, device=torch.device("cuda")):
         super().__init__()
 
-        if getattr(torch.version, "hip", None):
-            raise RuntimeError("TensorRT backend is incompatible with ROCm/PyTorch HIP builds.")
-        if not torch.cuda.is_available():
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
             raise RuntimeError(
-                "TensorRT backend requires an NVIDIA CUDA GPU. No CUDA device is available."
+                f"TensorRT backend requires a CUDA device, got '{self.device.type}'. CPUs/MLX are unsupported."
             )
-        # Normalize device
-        dev = torch.device(device)
-        if dev.type != "cuda":
-            raise RuntimeError(
-                f"TensorRT backend requires a CUDA device, got '{dev.type}'. CPUs/MLX are unsupported."
-            )
-        if dev.index is not None and dev.index >= torch.cuda.device_count():
-            raise RuntimeError(
-                f"Invalid CUDA device index {dev.index}; available count={torch.cuda.device_count()}"
-            )
-        self.device = dev
 
-        # Enforce TensorRT >= 10 (tensors API only)
+        # Simple, reliable version check: use TensorRT's __version__
+        ver = getattr(trt, "__version__", None)
+        if not ver:
+            raise RuntimeError("TensorRT >= 10 required (version unknown).")
         try:
-            ver = getattr(trt, "__version__", "0.0.0")
             major = int(str(ver).split(".")[0])
         except Exception:
-            major = 0
-            ver = "unknown"
+            raise RuntimeError(f"TensorRT >= 10 required (found {ver}).")
         if major < 10:
-            raise RuntimeError(
-                f"TensorRT >= 10 required (found {ver}). Legacy bindings API is unsupported."
-            )
+            raise RuntimeError(f"TensorRT >= 10 required (found {ver}).")
 
         logger = trt.Logger(trt.Logger.ERROR)
         with open(engine_path, "rb") as f, trt.Runtime(logger) as runtime:
             self._engine = runtime.deserialize_cuda_engine(f.read())
         self._ctx = self._engine.create_execution_context()
-        # Validate tensors API presence
-        if not (hasattr(self._engine, "num_io_tensors") and hasattr(self._ctx, "set_input_shape")):
-            raise RuntimeError(
-                "TensorRT tensors API not available. Please rebuild with TensorRT >= 10 and re-export the engine."
-            )
 
         # Names exported by our ONNX: 'input' -> y/style
         self._name_in = "input"
@@ -72,7 +70,6 @@ class TRTEngineModule(torch.nn.Module):
         for name in (self._name_in, self._name_y, self._name_s):
             self._engine.get_tensor_dtype(name)
 
-
         # Capture per-tensor dtypes from engine
         self._dtype_in = _to_torch_dtype(self._engine.get_tensor_dtype(self._name_in))
         self._dtype_y = _to_torch_dtype(self._engine.get_tensor_dtype(self._name_y))
@@ -87,7 +84,6 @@ class TRTEngineModule(torch.nn.Module):
         X = X.contiguous()
         N, C, H, W = X.shape
 
-        # -------- Tensor API (TRT 10+) --------
         # 1) Set input shape by name
         self._ctx.set_input_shape(self._name_in, (N, C, H, W))
 
@@ -97,7 +93,6 @@ class TRTEngineModule(torch.nn.Module):
         try:
             # If engine carries concrete dims (profile-dependent), use them
             s_dims = tuple(self._engine.get_tensor_shape(self._name_s))
-            # Replace -1 with concrete batch N if needed
             if any(d < 0 for d in s_dims):
                 S = s_dims[-1] if s_dims[-1] > 0 else 256
             else:
@@ -108,7 +103,6 @@ class TRTEngineModule(torch.nn.Module):
         y = torch.empty((N, 3, H, W), device=X.device, dtype=self._dtype_y)
         s = torch.empty((N, S), device=X.device, dtype=self._dtype_s)
 
-        # Use the current PyTorch stream to avoid hazards
         stream = torch.cuda.current_stream(self.device)
         stream_handle = int(stream.cuda_stream)
 
@@ -125,12 +119,13 @@ class TRTEngineModule(torch.nn.Module):
 
 class CellposeModelTRT(models.CellposeModel):
     """
-    Drop-in subclass that preserves the constructor and eval(...) interface.
-    Args (extra):
-      backend: 'trt' | 'onnxrt_trt'
-      engine_path: path to .plan (for backend='trt')
-      onnx_path: path to .onnx (for backend='onnxrt_trt' or validation)
-      fp16: bool, default True
+    Drop-in subclass for the main segmentation workflow (eval) using TensorRT.
+
+    - Uses a TensorRT engine whose forward returns exactly (y, style) as defined
+      in TRTEngineModule. This aligns with Cellpose's segmentation pipeline.
+    - Not intended for denoise/perceptual-loss training utilities or BioImage.IO
+      export paths that expect additional tensors beyond (y, style).
+
     """
 
     def __init__(
