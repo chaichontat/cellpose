@@ -115,6 +115,7 @@ class MainW_ortho2D(MainW):
             pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('g')), # YZ view H line (shows Y)
             pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('g'))  # XZ view H line (shows Z)
         ]
+        self._ortho_axes_linked = False
         self.make_orthoviews() # Create the ortho view boxes and image items
 
         # Add ortho view controls to the left panel (self.l0)
@@ -410,6 +411,7 @@ class MainW_ortho2D(MainW):
     def make_orthoviews(self):
         """ Creates the viewboxes and image items for ortho views. """
         self.pOrtho, self.imgOrtho, self.layerOrtho = [], [], []
+        self.anchorScatterOrtho = []
         self.labelOrtho = []
         for j in range(2):
             self.pOrtho.append(
@@ -428,6 +430,16 @@ class MainW_ortho2D(MainW):
             self.pOrtho[j].addItem(self.layerOrtho[j])
             self.pOrtho[j].addItem(self.vLineOrtho[j], ignoreBounds=False)
             self.pOrtho[j].addItem(self.hLineOrtho[j], ignoreBounds=False)
+            anchor_item = pg.ScatterPlotItem(
+                symbol="s",
+                size=8,
+                brush=self._anchor_brush,
+                pen=None,
+                pxMode=True,
+            )
+            anchor_item.setZValue(25)
+            self.anchorScatterOrtho.append(anchor_item)
+            self.pOrtho[j].addItem(anchor_item)
 
             # Add text label overlay inside each ortho view (top-left)
             lbl = pg.TextItem("")
@@ -438,10 +450,6 @@ class MainW_ortho2D(MainW):
             lbl.setZValue(10)
             self.labelOrtho.append(lbl)
             self.pOrtho[j].addItem(lbl)
-
-        self.pOrtho[0].linkView(self.pOrtho[0].YAxis, self.p0)
-        self.pOrtho[1].linkView(self.pOrtho[1].XAxis, self.p0)
-
 
     def add_orthoviews(self):
         self.yortho = self.Ly // 2
@@ -461,18 +469,29 @@ class MainW_ortho2D(MainW):
         #self.p0.linkView(self.p0.YAxis, self.pOrtho[0])
         #self.p0.linkView(self.p0.XAxis, self.pOrtho[1])
 
-        self.pOrtho[0].setYRange(0, self.Lx)
-        self.pOrtho[0].setXRange(-self.dz / 3, self.dz * 2 + self.dz / 3)
-        self.pOrtho[1].setYRange(-self.dz / 3, self.dz * 2 + self.dz / 3)
-        self.pOrtho[1].setXRange(0, self.Ly)
-        #self.pOrtho[0].setLimits(minXRange=self.dz*2+self.dz/3*2)
-        #self.pOrtho[1].setLimits(minYRange=self.dz*2+self.dz/3*2)
+        z_init = max(1, 2 * max(3, int(self.dz)))
+
+        # Configure ranges before linking to avoid pushing p0 offscreen.
+        self.pOrtho[0].setAspectLocked(lock=False)
+        self.pOrtho[0].setXRange(0, z_init, padding=0)
+        self.pOrtho[0].setYRange(0, self.Ly, padding=0)
+        self.pOrtho[0].setAspectLocked(lock=True, ratio=self.zaspect)
+
+        self.pOrtho[1].setAspectLocked(lock=False)
+        self.pOrtho[1].setYRange(0, z_init, padding=0)
+        self.pOrtho[1].setXRange(0, self.Lx, padding=0)
+        self.pOrtho[1].setAspectLocked(lock=True, ratio=1. / self.zaspect)
+        if not self._ortho_axes_linked:
+            self.pOrtho[0].linkView(self.pOrtho[0].YAxis, self.p0)
+            self.pOrtho[1].linkView(self.pOrtho[1].XAxis, self.p0)
+            self._ortho_axes_linked = True
 
         self.p0.addItem(self.vLine, ignoreBounds=False)
         self.p0.addItem(self.hLine, ignoreBounds=False)
 
         self.win.show()
         self.show()
+        self._update_ortho_anchor_display()
 
         #self.p0.linkView(self.p0.XAxis, self.pOrtho[1])
 
@@ -495,6 +514,7 @@ class MainW_ortho2D(MainW):
         self.vLineOrtho[0].setPos(self.zc)
         self.hLineOrtho[0].setPos(self.yortho)
         self._diff_update_crosshair_lines((self.yortho, self.xortho))
+        self._update_ortho_anchor_display()
 
     def get_crosshair_coords(self):
         return float(self.yortho), float(self.xortho)
@@ -812,11 +832,12 @@ class MainW_ortho2D(MainW):
         # Restore main view range (prevents zoom resets from axis-link side effects)
         if p0_xr is not None and p0_yr is not None:
             try:
-                self.p0.setXRange(p0_xr[0], p0_xr[1], padding=0)
-                self.p0.setYRange(p0_yr[0], p0_yr[1], padding=0)
+                self.p0.setRange(xRange=p0_xr, yRange=p0_yr, padding=0)
             except Exception:
                 pass
 
+        self._update_anchor_display()
+        self._update_ortho_anchor_display()
         self.win.show()
         self.show()
 
@@ -832,47 +853,111 @@ class MainW_ortho2D(MainW):
         if event.button()==QtCore.Qt.LeftButton \
                 and not event.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.AltModifier)\
                 and not self.removing_region:
+            items = self.win.scene().items(event.scenePos())
+            on_main_view = (
+                self.p0 in items or self.img in items or self.layer in items
+            )
             if event.double():
-                # Disable double-click zoom reset in ortho mode
+                if self.loaded and not self.in_stroke and on_main_view:
+                    pos = self.p0.mapSceneToView(event.scenePos())
+                    xx = int(round(pos.x()))
+                    yy = int(round(pos.y()))
+                    if 0 <= xx < self.Lx and 0 <= yy < self.Ly:
+                        self._add_anchor_point(xx, yy)
                 return
-            elif self.loaded and not self.in_stroke:
-                if self.orthobtn.isChecked():
-                    items = self.win.scene().items(event.scenePos())
-                    # 1) Prioritize clicks in orthoviews to avoid side-effects from main view
-                    if (self.pOrtho[0] in items) or (self.imgOrtho[0] in items) or (self.layerOrtho[0] in items):
-                        pos = self.pOrtho[0].mapSceneToView(event.scenePos())
-                        k = int(pos.x())
-                        zrange = getattr(self, '_zrange', max(1, 2*self.dz))
-                        k = max(0, min(k, zrange-1))
-                        zi_start = getattr(self, '_zi_start', max(0, self.zc_ortho - self.dz))
-                        z_abs = zi_start + k
-                        self.zc_ortho = max(0, min(z_abs, self.ortho_nz - 1))
-                        self._preserve_window = True
-                        self._next_z_click_local_k = k
+            if self.loaded and on_main_view and self._remove_anchor_at_scene_pos(event.scenePos()):
+                return
+            if self.loaded and not self.in_stroke and self.orthobtn.isChecked():
+                if (self.pOrtho[0] in items) or (self.imgOrtho[0] in items) or (self.layerOrtho[0] in items):
+                    pos = self.pOrtho[0].mapSceneToView(event.scenePos())
+                    k = int(pos.x())
+                    zrange = getattr(self, '_zrange', max(1, 2*self.dz))
+                    k = max(0, min(k, zrange - 1))
+                    zi_start = getattr(self, '_zi_start', max(0, self.zc_ortho - self.dz))
+                    z_abs = zi_start + k
+                    self.zc_ortho = max(0, min(z_abs, self.ortho_nz - 1))
+                    self._preserve_window = True
+                    self._next_z_click_local_k = k
+                    self.update_ortho()
+                    self._update_anchor_display()
+                    return
+                if (self.pOrtho[1] in items) or (self.imgOrtho[1] in items) or (self.layerOrtho[1] in items):
+                    pos = self.pOrtho[1].mapSceneToView(event.scenePos())
+                    k = int(pos.y())
+                    zrange = getattr(self, '_zrange', max(1, 2*self.dz))
+                    k = max(0, min(k, zrange - 1))
+                    zi_start = getattr(self, '_zi_start', max(0, self.zc_ortho - self.dz))
+                    z_abs = zi_start + k
+                    self.zc_ortho = max(0, min(z_abs, self.ortho_nz - 1))
+                    self._preserve_window = True
+                    self._next_z_click_local_k = k
+                    self.update_ortho()
+                    self._update_anchor_display()
+                    return
+                if on_main_view:
+                    pos = self.p0.mapSceneToView(event.scenePos())
+                    xx = int(pos.x())
+                    yy = int(pos.y())
+                    if 0 <= yy < self.Ly and 0 <= xx < self.Lx:
+                        self.yortho = yy
+                        self.xortho = xx
                         self.update_ortho()
                         return
-                    if (self.pOrtho[1] in items) or (self.imgOrtho[1] in items) or (self.layerOrtho[1] in items):
-                        pos = self.pOrtho[1].mapSceneToView(event.scenePos())
-                        k = int(pos.y())
-                        zrange = getattr(self, '_zrange', max(1, 2*self.dz))
-                        k = max(0, min(k, zrange-1))
-                        zi_start = getattr(self, '_zi_start', max(0, self.zc_ortho - self.dz))
-                        z_abs = zi_start + k
-                        self.zc_ortho = max(0, min(z_abs, self.ortho_nz - 1))
-                        self._preserve_window = True
-                        self._next_z_click_local_k = k
-                        self.update_ortho()
-                        return
-                    # 2) Otherwise, handle main XY clicks for crosshair move
-                    if (self.p0 in items) or (self.img in items) or (self.layer in items):
-                        pos = self.p0.mapSceneToView(event.scenePos())
-                        xx = int(pos.x())
-                        yy = int(pos.y())
-                        if 0 <= yy < self.Ly and 0 <= xx < self.Lx:
-                            self.yortho = yy
-                            self.xortho = xx
-                            self.update_ortho()
-                            return
+        super().plot_clicked(event)
+
+    def _update_ortho_anchor_display(self):
+        if not getattr(self, "anchorScatterOrtho", None):
+            return
+        if not getattr(self, "orthobtn", None) or not self.orthobtn.isChecked():
+            for item in self.anchorScatterOrtho:
+                item.setData([], [])
+            return
+        if self.stack_ortho is None or self.ortho_nz == 0:
+            for item in self.anchorScatterOrtho:
+                item.setData([], [])
+            return
+        zi_start = getattr(self, "_zi_start", None)
+        zrange = getattr(self, "_zrange", None)
+        if zi_start is None or zrange is None:
+            for item in self.anchorScatterOrtho:
+                item.setData([], [])
+            return
+        x_cross = int(round(getattr(self, "xortho", 0)))
+        y_cross = int(round(getattr(self, "yortho", 0)))
+        yz_x, yz_y, xz_x, xz_y = [], [], [], []
+        for plane, anchors in self._anchor_points_by_plane.items():
+            try:
+                plane_idx = int(plane)
+            except Exception:
+                continue
+            local_k = plane_idx - zi_start
+            if not (0 <= local_k < zrange):
+                continue
+            for anchor in anchors:
+                if anchor["x"] == x_cross:
+                    yz_x.append(local_k)
+                    yz_y.append(anchor["y"])
+                if anchor["y"] == y_cross:
+                    xz_x.append(anchor["x"])
+                    xz_y.append(local_k)
+        self.anchorScatterOrtho[0].setData(
+            yz_x,
+            yz_y,
+            symbol="s",
+            size=8,
+            brush=self._anchor_brush,
+            pen=None,
+            pxMode=True,
+        )
+        self.anchorScatterOrtho[1].setData(
+            xz_x,
+            xz_y,
+            symbol="s",
+            size=8,
+            brush=self._anchor_brush,
+            pen=None,
+            pxMode=True,
+        )
 
 
     def update_plot(self):

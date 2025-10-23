@@ -9,11 +9,10 @@ from qtpy import QtGui, QtCore
 from superqt import QRangeSlider, QCollapsible
 from qtpy.QtWidgets import QScrollArea, QMainWindow, QApplication, QWidget, QScrollBar, \
     QComboBox, QGridLayout, QPushButton, QFrame, QCheckBox, QLabel, QProgressBar, \
-        QLineEdit, QMessageBox, QGroupBox, QMenu, QAction
+        QLineEdit, QMessageBox, QGroupBox
 import pyqtgraph as pg
 
 import numpy as np
-from scipy.stats import mode
 import cv2
 
 from . import guiparts, menus, io
@@ -709,6 +708,13 @@ class MainW(QMainWindow):
         if event.key() == QtCore.Qt.Key_Space and not event.isAutoRepeat():
             self._diff_drag_active = True
             self._diff_drag_last_update = 0.0
+            event.accept()
+            return
+        if (event.key() == QtCore.Qt.Key_X and
+                event.modifiers() & QtCore.Qt.ShiftModifier and
+                not event.isAutoRepeat()):
+            if self.loaded:
+                self._clear_anchor_points()
             event.accept()
             return
         if self.loaded:
@@ -1962,6 +1968,96 @@ class MainW(QMainWindow):
         self.p0.addItem(self.img)
         self.p0.addItem(self.layer)
         self.p0.addItem(self.scale)
+        self._anchor_brush = pg.mkBrush(0, 255, 255, 255)
+        self.anchor_scatter = pg.ScatterPlotItem(
+            symbol="s",
+            size=8,
+            brush=self._anchor_brush,
+            pen=None,
+            pxMode=True,
+        )
+        self.anchor_scatter.setZValue(20)
+        self.p0.addItem(self.anchor_scatter)
+        self._anchor_points_by_plane = {}
+
+    def _anchor_plane_index(self):
+        plane = getattr(self, "currentZ", 0)
+        if hasattr(self, "zc_ortho"):
+            try:
+                plane = int(self.zc_ortho)
+            except Exception:
+                plane = int(plane)
+        return int(plane)
+
+    def _refresh_anchor_views(self):
+        self._update_anchor_display()
+        self._update_ortho_anchor_display()
+
+    def _update_anchor_display(self):
+        if not hasattr(self, "anchor_scatter"):
+            return
+        plane = self._anchor_plane_index()
+        anchors = self._anchor_points_by_plane.get(plane, [])
+        if not anchors:
+            self.anchor_scatter.setData([], [])
+            return
+        xs = [pt["x"] for pt in anchors]
+        ys = [pt["y"] for pt in anchors]
+        self.anchor_scatter.setData(
+            xs,
+            ys,
+            symbol="s",
+            size=8,
+            brush=self._anchor_brush,
+            pen=None,
+            pxMode=True,
+        )
+
+    def _update_ortho_anchor_display(self):
+        """Overridden in ortho subclass."""
+        return
+
+    def _add_anchor_point(self, x, y):
+        plane = self._anchor_plane_index()
+        anchor_list = self._anchor_points_by_plane.setdefault(plane, [])
+        for anchor in anchor_list:
+            if anchor["x"] == x and anchor["y"] == y:
+                return
+        anchor_list.append({"x": x, "y": y})
+        self._refresh_anchor_views()
+
+    def _remove_anchor_at_scene_pos(self, scene_pos):
+        if not hasattr(self, "anchor_scatter"):
+            return False
+        spots = self.anchor_scatter.pointsAt(scene_pos)
+        if spots is None or len(spots) == 0:
+            return False
+        plane = self._anchor_plane_index()
+        anchor_list = self._anchor_points_by_plane.get(plane, [])
+        if not anchor_list:
+            return False
+        to_remove = set()
+        for spot in spots:
+            pos = spot.pos()
+            to_remove.add((int(round(pos.x())), int(round(pos.y()))))
+        if not to_remove:
+            return False
+        filtered = [
+            anchor for anchor in anchor_list
+            if (anchor["x"], anchor["y"]) not in to_remove
+        ]
+        removed = len(anchor_list) != len(filtered)
+        if removed:
+            if filtered:
+                self._anchor_points_by_plane[plane] = filtered
+            else:
+                del self._anchor_points_by_plane[plane]
+            self._refresh_anchor_views()
+        return removed
+
+    def _clear_anchor_points(self):
+        self._anchor_points_by_plane.clear()
+        self._refresh_anchor_views()
 
     def reset(self):
         # ---- start sets of points ---- #
@@ -1978,6 +2074,7 @@ class MainW(QMainWindow):
         self.zdraw = []
         self.removed_cell = []
         self.cellcolors = np.array([255, 255, 255])[np.newaxis, :]
+        self._anchor_points_by_plane = {}
 
         # -- zero out image stack -- #
         self.opacity = 128  # how opaque masks should be
@@ -2094,6 +2191,7 @@ class MainW(QMainWindow):
         self.toggle_removals()
         self.update_scale()
         self.update_layer()
+        self._refresh_anchor_views()
 
     def select_cell(self, idx):
         self.prev_selected = self.selected
@@ -2328,12 +2426,20 @@ class MainW(QMainWindow):
         if event.button()==QtCore.Qt.LeftButton \
                 and not event.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.AltModifier)\
                 and not self.removing_region:
+            items = self.win.scene().items(event.scenePos())
+            on_main_view = (
+                self.p0 in items or self.img in items or self.layer in items
+            )
             if event.double():
-                try:
-                    self.p0.setYRange(0, self.Ly + self.pr)
-                except:
-                    self.p0.setYRange(0, self.Ly)
-                self.p0.setXRange(0, self.Lx)
+                if self.loaded and not self.in_stroke and on_main_view:
+                    pos = self.p0.mapSceneToView(event.scenePos())
+                    xx = int(round(pos.x()))
+                    yy = int(round(pos.y()))
+                    if 0 <= xx < self.Lx and 0 <= yy < self.Ly:
+                        self._add_anchor_point(xx, yy)
+                return
+            if self.loaded and on_main_view and self._remove_anchor_at_scene_pos(event.scenePos()):
+                return
 
     def cancel_remove_multiple(self):
         self.clear_multi_selected_cells()
@@ -2463,6 +2569,7 @@ class MainW(QMainWindow):
                 self.saturation[r][self.currentZ][0],
                 self.saturation[r][self.currentZ][1]
             ])
+        self._refresh_anchor_views()
         self.win.show()
         self.show()
 
