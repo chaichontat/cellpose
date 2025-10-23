@@ -13,16 +13,10 @@
   the standard `CellposeModel` to run CellposeSAM via TensorRT.
 """
 
-import ctypes
-
 import tensorrt as trt
 import torch
 
 from cellpose import models
-
-
-def _torch_ptr(t: torch.Tensor):
-    return ctypes.c_void_p(t.data_ptr()).value
 
 
 class TRTEngineModule(torch.nn.Module):
@@ -84,15 +78,30 @@ class TRTEngineModule(torch.nn.Module):
 
         self.dtype = self._dtype_in
 
+        # Detect fixed batch dimension from engine input shape (None if dynamic)
+        self._in_dims = tuple(self._engine.get_tensor_shape(self._name_in))  # (N,C,H,W) with -1 for dynamic dims
+        self._fixedN = self._in_dims[0] if self._in_dims[0]> 0 else None
+
     def forward(self, X: torch.Tensor):
-        assert X.is_cuda, "Input must be a CUDA tensor"
+        if not X.is_cuda:
+            raise RuntimeError("Input must be a CUDA tensor")
+        if X.device != self.device:
+            X = X.to(self.device, non_blocking=True)
         if X.dtype != self._dtype_in:
             X = X.to(self._dtype_in)
         X = X.contiguous()
         N, C, H, W = X.shape
 
+        # Require exact N match when engine has fixed batch.
+        if self._fixedN is not None and N != self._fixedN:
+            raise ValueError(
+                f"Input batch {N} must equal engine fixed batch N={self._fixedN}. "
+                f"Adjust batch_size or rebuild the engine."
+            )
+        effective_N = self._fixedN or N
+
         # 1) Set input shape by name
-        self._ctx.set_input_shape(self._name_in, (N, C, H, W))
+        self._ctx.set_input_shape(self._name_in, (effective_N, C, H, W))
 
         # 2) Allocate outputs; query shapes from engine (may have -1 -> allocate by heuristics if needed)
         #    Cellpose heads are [N,3,H,W] and [N,S], so we can shape from input.
@@ -107,15 +116,15 @@ class TRTEngineModule(torch.nn.Module):
         except Exception:
             S = 256
 
-        y = torch.empty((N, 3, H, W), device=X.device, dtype=self._dtype_y)
-        s = torch.empty((N, S), device=X.device, dtype=self._dtype_s)
+        y = torch.empty((effective_N, 3, H, W), device=X.device, dtype=self._dtype_y)
+        s = torch.empty((effective_N, S), device=X.device, dtype=self._dtype_s)
 
         stream = torch.cuda.current_stream(self.device)
         stream_handle = int(stream.cuda_stream)
 
-        self._ctx.set_tensor_address(self._name_in, _torch_ptr(X))
-        self._ctx.set_tensor_address(self._name_y, _torch_ptr(y))
-        self._ctx.set_tensor_address(self._name_s, _torch_ptr(s))
+        self._ctx.set_tensor_address(self._name_in, int(X.data_ptr()))
+        self._ctx.set_tensor_address(self._name_y, int(y.data_ptr()))
+        self._ctx.set_tensor_address(self._name_s, int(s.data_ptr()))
 
         ok = self._ctx.execute_async_v3(stream_handle)
         if not ok:
@@ -167,6 +176,6 @@ class CellposeModelTRT(models.CellposeModel):
         self.net = TRTEngineModule(engine_path, device=dev)
 
     def eval(self, x, **kwargs):
-        if kwargs.get("bsize", 256) != 256:
-            raise ValueError("CellposeModelTRT only supports bsize=256")
+        if kwargs.get("bsize", 256) != self.net._in_dims[2]:
+            raise ValueError(f"This engine only supports bsize={self.net._in_dims[2]} (built with this bsize)")
         return super().eval(x, **kwargs)
