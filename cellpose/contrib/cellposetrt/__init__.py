@@ -9,9 +9,11 @@
   A CellposeSAM model can be converted to the TensorRT format by running
   cellpose/contrib/cellposetrt/trt_build.py.
 
-  `CellposeModelTRT(engine_path=...)` in this module is a drop-in replacement for
+  `CellposeModelTRT(pretrained_model=PATH.plan)` in this module is a drop-in replacement for
   the standard `CellposeModel` to run CellposeSAM via TensorRT.
 """
+
+from pathlib import Path
 
 import tensorrt as trt
 import torch
@@ -29,7 +31,7 @@ class TRTEngineModule(torch.nn.Module):
     - Requires TensorRT >= 10.
     - Engines are compiled for fixed profiles batch size and tile size.
     """
-    def __init__(self, engine_path: str, device=torch.device("cuda")):
+    def __init__(self, engine_path: str|Path, device=torch.device("cuda")):
         super().__init__()
 
         self.device = torch.device(device)
@@ -50,7 +52,11 @@ class TRTEngineModule(torch.nn.Module):
 
         logger = trt.Logger(trt.Logger.ERROR)
         with open(engine_path, "rb") as f, trt.Runtime(logger) as runtime:
-            self._engine = runtime.deserialize_cuda_engine(f.read())
+            try:
+                self._engine = runtime.deserialize_cuda_engine(f.read())
+            except Exception as exc:
+                raise ValueError(f"{engine_path} is not a valid TensorRT engine") from exc
+
         self._ctx = self._engine.create_execution_context()
 
         # Names exported by our ONNX: 'input' -> y/style
@@ -93,12 +99,24 @@ class TRTEngineModule(torch.nn.Module):
         N, C, H, W = X.shape
 
         # Require exact N match when engine has fixed batch.
-        if self._fixedN is not None and N != self._fixedN:
-            raise ValueError(
-                f"Input batch {N} must equal engine fixed batch N={self._fixedN}. "
-                f"Adjust batch_size or rebuild the engine."
-            )
-        effective_N = self._fixedN or N
+        pad= 0
+        if self._fixedN is not None:
+            if N > self._fixedN:
+                raise ValueError(
+                    f"Input batch {N} must equal engine fixed batch N={self._fixedN}. "
+                    f"Adjust batch_size or rebuild the engine."
+                )
+            if N < self._fixedN:
+                pad = self._fixedN - N
+                Xp = torch.empty((self._fixedN, C, H, W), device=X.device, dtype=X.dtype)
+                Xp[:N] = X
+                replica = X[-1:].expand(pad, -1, -1, -1)
+                Xp[N:] = replica
+                X = Xp
+                del Xp, replica
+            effective_N = self._fixedN
+        else:
+            effective_N = N
 
         # 1) Set input shape by name
         self._ctx.set_input_shape(self._name_in, (effective_N, C, H, W))
@@ -130,6 +148,10 @@ class TRTEngineModule(torch.nn.Module):
         if not ok:
             raise RuntimeError("TensorRT execute_async_v3 failed")
 
+        if pad:
+            y = y[:N]
+            s = s[:N]
+
         return y, s
 
 
@@ -139,7 +161,7 @@ class CellposeModelTRT(models.CellposeModel):
     Preparation
     - Build an engine for your model first with scripts/trt_build.py, for example:
       python scripts/trt_build.py PRETRAINED -o OUTPUT.plan --batch-size 4 --bsize 256
-      Then pass engine_path=OUTPUT.plan to this class.
+      Then pass pretrained_model=OUTPUT.plan to this class.
 
     Contract
     - Uses a TensorRT engine whose forward returns exactly (y, style) as defined
@@ -151,17 +173,23 @@ class CellposeModelTRT(models.CellposeModel):
     def __init__(
         self,
         gpu=False,
-        pretrained_model="cyto2",
+        pretrained_model: str | Path | None = None,
         model_type=None,
         diam_mean=None,
         device=None,
         nchan=None,
         use_bfloat16=True,
-        engine_path=None,
     ):
+        if pretrained_model is None:
+            raise ValueError("TensorRT engine (.plan) must be generated from `trt_build.py` and provided via `pretrained_model`.")
+        engine_path = Path(pretrained_model)
+        if not engine_path.is_file():
+            raise FileNotFoundError(f"TensorRT engine not found at {engine_path}")
+        self.engine_path = engine_path
+
         super().__init__(
             gpu=gpu,
-            pretrained_model=pretrained_model,
+            pretrained_model="cpsam",  # dummy, not used
             model_type=model_type,
             diam_mean=diam_mean,
             device=device,
@@ -171,9 +199,9 @@ class CellposeModelTRT(models.CellposeModel):
         dev = torch.device("cuda" if device is None else device)
         if not use_bfloat16:
             raise ValueError("CellposeModelTRT only supports use_bfloat16=True")
-        if engine_path is None:
-            raise ValueError("engine_path must be provided for CellposeModelTRT")
+
         self.net = TRTEngineModule(engine_path, device=dev)
+        self.pretrained_model = str(engine_path)
 
     def eval(self, x, **kwargs):
         if kwargs.get("bsize", 256) != self.net._in_dims[2]:
