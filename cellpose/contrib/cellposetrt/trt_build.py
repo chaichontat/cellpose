@@ -57,35 +57,67 @@ class _CPNetWrapper(torch.nn.Module):
         return y, style
 
 
-def export_onnx(pretrained_model: str, onnx_out: str, *, batch_size: int, bsize: int, opset: int = 20):
+def export_onnx(
+    pretrained_model: str,
+    onnx_out: str,
+    *,
+    batch_size: int,
+    bsize: int,
+    opset: int = 20,
+    dtype: torch.dtype = torch.bfloat16,
+    dynamo: bool = False,
+    dynamic_batch: bool = True,
+):
     device = torch.device("cuda")
-    model = models.CellposeModel(gpu=True, pretrained_model=pretrained_model, use_bfloat16=True)
-    net = model.net.to(device).eval()
+    if dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError(f"Unsupported export dtype {dtype}. Expected torch.bfloat16 or torch.float32.")
+    model = models.CellposeModel(
+        gpu=True,
+        pretrained_model=pretrained_model,
+        use_bfloat16=(dtype == torch.bfloat16),
+    )
+    net = model.net.to(device=device, dtype=dtype).eval()
 
-    # Ensure weights are BF16 as expected
+    # Ensure weights match requested export precision
     param_dtypes = {p.dtype for p in net.parameters()}
-    if torch.float32 in param_dtypes:
-        raise RuntimeError(f"Loaded model contains FP32 parameters: {param_dtypes}. Expected BF16 only.")
+    if dtype == torch.bfloat16:
+        if torch.float32 in param_dtypes:
+            raise RuntimeError(f"Loaded model contains FP32 parameters: {param_dtypes}. Expected BF16 only.")
+    else:
+        if torch.bfloat16 in param_dtypes:
+            raise RuntimeError(f"Loaded model contains BF16 parameters: {param_dtypes}. Expected FP32 only.")
     wrapper = _CPNetWrapper(net)
 
-    dummy = torch.randn(batch_size, 3, bsize, bsize, device=device, dtype=torch.bfloat16)
+    dummy = torch.randn(batch_size, 3, bsize, bsize, device=device, dtype=dtype)
     Path(os.path.dirname(onnx_out) or ".").mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            dummy,
-            onnx_out,
-            opset_version=opset,
-            dynamo=False,
-            input_names=["input"],
-            output_names=["y", "style"],
-            dynamic_axes={
-                "input": {0: "batch"},
-                "y": {0: "batch"},
-                "style": {0: "batch"}
-            },
-            do_constant_folding=True,
-        )
+        if dynamic_batch:
+            torch.onnx.export(
+                wrapper,
+                dummy,
+                onnx_out,
+                opset_version=opset,
+                dynamo=dynamo,
+                input_names=["input"],
+                output_names=["y", "style"],
+                dynamic_axes={
+                    "input": {0: "batch"},
+                    "y": {0: "batch"},
+                    "style": {0: "batch"},
+                },
+                do_constant_folding=True,
+            )
+        else:
+            torch.onnx.export(
+                wrapper,
+                dummy,
+                onnx_out,
+                opset_version=opset,
+                dynamo=dynamo,
+                input_names=["input"],
+                output_names=["y", "style"],
+                do_constant_folding=True,
+            )
     print(f"Exported ONNX to {onnx_out}.")
 
 
@@ -157,7 +189,13 @@ def main():
     plan_path = args.output
     p = Path(plan_path)
     onnx_out = str(p.with_suffix(".onnx"))
-    export_onnx(args.pretrained_model, onnx_out, batch_size=args.batch_size, bsize=args.bsize, opset=args.opset)
+    export_onnx(
+        args.pretrained_model,
+        onnx_out,
+        batch_size=args.batch_size,
+        bsize=args.bsize,
+        opset=args.opset,
+    )
     build_engine(onnx_out, plan_path, batch_size=args.batch_size, bsize=args.bsize, vram=args.vram)
 
 
