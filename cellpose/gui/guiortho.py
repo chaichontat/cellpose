@@ -8,6 +8,7 @@ Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer a
 
 import re
 import sys, os, pathlib, warnings, datetime, time
+from collections import OrderedDict
 
 from qtpy import QtGui, QtCore
 from superqt import QRangeSlider
@@ -97,6 +98,12 @@ class MainW_ortho2D(MainW):
         self.dz = 10            # Number of Z planes to show above/below main plane in ortho views
         self.zaspect = 6.0      # Z-aspect ratio for ortho views
         self._ortho_seg_warned = False  # Track whether we've logged segmentation alignment warnings
+
+        # Cache repeated ortho loads so adjacent tile flicks don't re-read everything
+        self._ortho_cache_key = None
+        self._ortho_cache = OrderedDict()
+        self._ortho_cache_shape = None
+        self._ortho_cache_limit = 120  # cap cached slices to prevent runaway memory use
 
         # MainW expects a resample control when handling 3D flows; default to True so
         # downstream logic that checks self.resample works even without a checkbox.
@@ -270,11 +277,13 @@ class MainW_ortho2D(MainW):
                     main_z_index = int(m_z.group(2))
                     glob_glob = f"{family}_z*{ext}"
                     stem_regex = re.compile(rf'^{re.escape(family)}_z(\d+)$')
+                    pattern_tag = "underscore"
                 else:
                     family = m_dash.group(1)
                     main_z_index = int(m_dash.group(2))
                     glob_glob = f"{family}-*{ext}"
                     stem_regex = re.compile(rf'^{re.escape(family)}-(\d+)$')
+                    pattern_tag = "dash"
                 glob_pattern = str(folder / glob_glob)
                 print(f"GUI_INFO: Globbing for Z-stack: {glob_pattern}")
 
@@ -293,6 +302,12 @@ class MainW_ortho2D(MainW):
                      self.stack_ortho = self.stack.copy() # Use main stack as ortho stack
                      self.zc_ortho = 0
                 else:
+                    cache_key = (str(folder.resolve()), pattern_tag, family, ext.lower())
+                    if getattr(self, "_ortho_cache_key", None) != cache_key:
+                        self._ortho_cache_key = cache_key
+                        self._ortho_cache = OrderedDict()
+                        self._ortho_cache_shape = None
+
                     # Sort files by Z-index
                     sorted_z = sorted(z_files_dict.keys())
                     sorted_files = [z_files_dict[z] for z in sorted_z]
@@ -315,32 +330,54 @@ class MainW_ortho2D(MainW):
                     images = []
                     used_files = []
                     used_z_indices = []
-                    ref_shape = None
-                    for i, (z_idx, f) in enumerate(zip(sorted_z, sorted_files)):
-                        try:
-                            img = imread(f)
-                            # Basic preprocessing (like in io._load_image)
-                            if img.ndim == 2:
-                                img = img[:, :, np.newaxis]
-                            if img.shape[0] < 4 or img.shape[1] < 4: # Handle channel dim placement
-                                img = np.transpose(img, (1,2,0))
-                            # Check shape consistency
-                            current_shape = img.shape[:2] + (img.shape[2],) # Y, X, C
-                            if ref_shape is None:
-                                ref_shape = current_shape
-                            elif current_shape[:2] != ref_shape[:2]: # Check Y, X only
-                                print(f"GUI_WARNING: Skipping file {f} due to shape mismatch ({current_shape[:2]} vs {ref_shape[:2]})")
+                    for z_idx, f in zip(sorted_z, sorted_files):
+                        cached = self._ortho_cache.get(z_idx)
+                        if cached is None:
+                            try:
+                                img = imread(f)
+                                if img.ndim == 2:
+                                    img = img[:, :, np.newaxis]
+                                if img.shape[0] < 4 or img.shape[1] < 4:
+                                    img = np.transpose(img, (1, 2, 0))
+                                current_shape_2d = img.shape[:2]
+                                if self._ortho_cache_shape is None:
+                                    self._ortho_cache_shape = current_shape_2d
+                                elif current_shape_2d != self._ortho_cache_shape:
+                                    print(
+                                        f"GUI_WARNING: Skipping file {f} due to shape mismatch "
+                                        f"({current_shape_2d} vs {self._ortho_cache_shape})"
+                                    )
+                                    continue
+                                if self.nchan > 1 and img.shape[-1] == 1:
+                                    img = np.repeat(img, 3, axis=-1)
+                                elif img.shape[-1] > 3:
+                                    img = img[..., :3]
+                                img = img.astype(np.float32, copy=False)
+                                self._ortho_cache[z_idx] = img
+                                self._ortho_cache.move_to_end(z_idx)
+                                if len(self._ortho_cache) > self._ortho_cache_limit:
+                                    removed_idx, _ = self._ortho_cache.popitem(last=False)
+                                    print(f"GUI_INFO: Evicted ortho slice z={removed_idx} from cache (LRU cap {self._ortho_cache_limit}).")
+                                cached = img
+                            except Exception as e_read:
+                                print(f"GUI_WARNING: Could not read or process file {f}: {e_read}")
                                 continue
-                            # Ensure 3 channels if RGB mode is likely
-                            if self.nchan > 1 and img.shape[-1] == 1: # If main img is color, expand gray Z
-                                img = np.repeat(img, 3, axis=-1)
-                            elif img.shape[-1] > 3: # Take first 3 channels if more exist
-                                img = img[..., :3]
-                            images.append(img)
+                        else:
+                            self._ortho_cache.move_to_end(z_idx)
+                            if self._ortho_cache_shape is None:
+                                self._ortho_cache_shape = cached.shape[:2]
+                            elif cached.shape[:2] != self._ortho_cache_shape:
+                                print(
+                                    f"GUI_WARNING: Cached ortho slice for z={z_idx} has shape {cached.shape[:2]} "
+                                    f"but expected {self._ortho_cache_shape}; discarding."
+                                )
+                                self._ortho_cache.pop(z_idx, None)
+                                continue
+
+                        if cached is not None:
+                            images.append(cached)
                             used_files.append(f)
                             used_z_indices.append(z_idx)
-                        except Exception as e_read:
-                            print(f"GUI_WARNING: Could not read or process file {f}: {e_read}")
 
                     if not images:
                         print("GUI_ERROR: Failed to load any valid Z-stack images.")
@@ -398,7 +435,6 @@ class MainW_ortho2D(MainW):
 
         # Update UI elements
         self.enable_buttons() # Re-enable buttons after load
-        self.update_plot()    # Update main plot and ortho views if active
         self.update_layer()   # Update mask layer display
         self.update_scale()   # Update scale disk
 
@@ -513,7 +549,7 @@ class MainW_ortho2D(MainW):
         self.hLineOrtho[1].setPos(self.zc)
         self.vLineOrtho[0].setPos(self.zc)
         self.hLineOrtho[0].setPos(self.yortho)
-        self._diff_update_crosshair_lines((self.yortho, self.xortho))
+        self._diff_update_crosshair_lines((self.yortho, self.xortho), reason="ortho")
         self._update_ortho_anchor_display()
 
     def get_crosshair_coords(self):

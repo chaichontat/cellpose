@@ -16,7 +16,9 @@ import numpy as np
 import cv2
 
 from . import guiparts, menus, io
+from .diffhooks import note_manual_edit
 from .diffcache import DiffStateCache
+from .diffcrosshair import DiffCrosshairHub
 from .. import models, core, dynamics, version, train
 from ..utils import download_url_to_file, masks_to_outlines, diameters
 from ..io import get_image_files, imsave, imread
@@ -553,6 +555,13 @@ class MainW(QMainWindow):
         self._diff_state_old = None
         self._diff_state_new = None
         self._diff_showing_restored = False
+        self._diff_state_old_manual_override = False
+        self._diff_overlay_reference_masks = None
+        self._diff_overlay_reference_active = False
+        self._diff_preserve_overlay_reference = False
+        self._diff_crosshair_suppress_broadcast = False
+        self._diff_crosshair_hub = DiffCrosshairHub.instance()
+        self._diff_crosshair_hub.register(self)
 
         widget_row += 1
 
@@ -896,6 +905,7 @@ class MainW(QMainWindow):
 
     def _diff_refresh_seg_path(self):
         self._diff_state_old = None
+        self._diff_state_old_manual_override = False
         if isinstance(self.filename, str) and self.filename:
             candidate = os.path.splitext(self.filename)[0] + "_seg.npy"
             if os.path.exists(candidate):
@@ -910,7 +920,8 @@ class MainW(QMainWindow):
     def _diff_update_button_state(self):
         if not hasattr(self, "diffButton"):
             return
-        has_saved = self._diff_seg_path is not None and os.path.exists(self._diff_seg_path)
+        seg_path = self._diff_seg_file()
+        has_saved = seg_path is not None and os.path.exists(seg_path)
         has_prediction = isinstance(self._diff_latest_masks, np.ndarray)
         prediction_dims_ok = False
         if has_prediction:
@@ -1023,7 +1034,9 @@ class MainW(QMainWindow):
             self._diff_last_shape = last_shape
             self._diff_z_index = z_index
             if self._diff_last_crosshair is not None:
-                self._diff_update_crosshair_lines(self._diff_last_crosshair)
+                self._diff_update_crosshair_lines(
+                    self._diff_last_crosshair, reason="restore"
+                )
         except Exception as exc:
             print(f"GUI_WARNING: failed to restore diff state for {key}: {exc}")
             cache.discard(key)
@@ -1033,12 +1046,7 @@ class MainW(QMainWindow):
     def get_crosshair_coords(self):
         return self._diff_last_crosshair
 
-    def _diff_on_close(self, event):
-        if getattr(event, "canvas", None) is None:
-            return
-        if getattr(event.canvas, "figure", None) is not getattr(self, "_diff_fig", None):
-            return
-        self._diff_disconnect_handlers(event.canvas)
+    def _diff_reset_state(self):
         self._diff_fig = None
         self._diff_ax = None
         self._diff_img_im = None
@@ -1049,6 +1057,22 @@ class MainW(QMainWindow):
         self._diff_crosshair_lines = None
         self._diff_last_shape = None
         self._diff_last_crosshair = None
+        self._diff_state_old_manual_override = False
+        self._diff_crosshair_suppress_broadcast = False
+        self._diff_clear_overlay_reference()
+
+    def _diff_clear_overlay_reference(self):
+        self._diff_overlay_reference_masks = None
+        self._diff_overlay_reference_active = False
+        self._diff_preserve_overlay_reference = False
+
+    def _diff_on_close(self, event):
+        if getattr(event, "canvas", None) is None:
+            return
+        if getattr(event.canvas, "figure", None) is not getattr(self, "_diff_fig", None):
+            return
+        self._diff_disconnect_handlers(event.canvas)
+        self._diff_reset_state()
 
     def _diff_disconnect_handlers(self, canvas):
         if canvas is None:
@@ -1063,7 +1087,21 @@ class MainW(QMainWindow):
                 canvas.mpl_disconnect(self._diff_scroll_cid)
             except Exception:
                 pass
-    def _diff_update_crosshair_lines(self, coords=None):
+
+    def _diff_close_existing(self):
+        fig = getattr(self, "_diff_fig", None)
+        if fig is None:
+            return
+        canvas = getattr(fig, "canvas", None)
+        if canvas is not None:
+            self._diff_disconnect_handlers(canvas)
+        try:
+            plt.close(fig)
+        except Exception as exc:
+            print(f"GUI_WARNING: failed to close existing diff viewer: {exc}")
+        self._diff_reset_state()
+
+    def _diff_update_crosshair_lines(self, coords=None, *, reason=None):
         if not MATPLOTLIB:
             return
         fig = getattr(self, "_diff_fig", None)
@@ -1071,14 +1109,7 @@ class MainW(QMainWindow):
         if fig is None or ax is None:
             return
         if not plt.fignum_exists(fig.number):
-            self._diff_fig = None
-            self._diff_ax = None
-            self._diff_img_im = None
-            self._diff_diff_rgb = None
-            self._diff_click_cid = None
-            self._diff_z_index = None
-            self._diff_crosshair_lines = None
-            self._diff_last_shape = None
+            self._diff_reset_state()
             return
         if coords is None:
             coords = self.get_crosshair_coords()
@@ -1101,6 +1132,31 @@ class MainW(QMainWindow):
             hline.set_ydata([y, y])
             vline.set_xdata([x, x])
         fig.canvas.draw_idle()
+        if (
+            hasattr(self, "_diff_crosshair_hub")
+            and self._diff_crosshair_hub is not None
+            and not getattr(self, "_diff_crosshair_suppress_broadcast", False)
+        ):
+            self._diff_crosshair_hub.set_coords(
+                (y, x), source=self, reason=reason or "local"
+            )
+
+    def diff_crosshair_updated(self, coords, *, source=None, reason=None):
+        if coords is None:
+            return
+        try:
+            y, x = coords
+        except (TypeError, ValueError):
+            return
+        self._diff_last_crosshair = (float(y), float(x))
+        prev = self._diff_crosshair_suppress_broadcast
+        self._diff_crosshair_suppress_broadcast = True
+        try:
+            self._diff_update_crosshair_lines(
+                self._diff_last_crosshair, reason=reason or "hub"
+            )
+        finally:
+            self._diff_crosshair_suppress_broadcast = prev
 
     def _diff_can_reset(self) -> tuple[bool, str]:
         state_old = self._diff_get_saved_state(reload=False)
@@ -1124,20 +1180,27 @@ class MainW(QMainWindow):
         return True, ""
 
     def _diff_get_saved_state(self, reload: bool = False):
-        if self._diff_seg_path is None:
+        manual_override = getattr(self, "_diff_state_old_manual_override", False)
+        if manual_override and self._diff_state_old is not None:
+            return self._diff_state_old
+        seg_path = self._diff_seg_file()
+        if seg_path is None:
             self._diff_state_old = None
+            self._diff_state_old_manual_override = False
             return None
         if not reload and self._diff_state_old is not None:
             return self._diff_state_old
         try:
-            dat = np.load(self._diff_seg_path, allow_pickle=True).item()
+            dat = np.load(seg_path, allow_pickle=True).item()
         except Exception as exc:
             print(f"GUI_WARNING: failed to load saved masks for diff: {exc}")
             self._diff_state_old = None
+            self._diff_state_old_manual_override = False
             return None
         masks = dat.get("masks")
         if masks is None:
             self._diff_state_old = None
+            self._diff_state_old_manual_override = False
             return None
         masks = np.asarray(masks)
         if masks.ndim == 2:
@@ -1156,6 +1219,7 @@ class MainW(QMainWindow):
             "colors": colors.astype(colors.dtype, copy=True) if isinstance(colors, np.ndarray) else colors,
         }
         self._diff_state_old = state
+        self._diff_state_old_manual_override = False
         return state
 
     def _diff_store_current_as_new(self):
@@ -1182,12 +1246,23 @@ class MainW(QMainWindow):
             self._diff_state_new = None
             self._diff_latest_masks = None
             return
+        preserve_overlay = bool(getattr(self, "_diff_preserve_overlay_reference", False))
+        if not preserve_overlay:
+            self._diff_clear_overlay_reference()
         self._diff_state_new = {
             "masks": masks,
             "outlines": outlines,
             "colors": colors,
         }
-        self._diff_latest_masks = masks.copy()
+        self._diff_state_old_manual_override = False
+        if not preserve_overlay or self._diff_latest_masks is None:
+            self._diff_latest_masks = masks.copy()
+
+    def _diff_note_manual_edit(self):
+        """Update diff caches after any manual mask changes."""
+        if not hasattr(self, "_diff_seg_path"):
+            return
+        note_manual_edit(self)
 
     def _diff_apply_state(self, state: dict, treat_as_new: bool):
         if state is None or state.get("masks") is None:
@@ -1210,11 +1285,21 @@ class MainW(QMainWindow):
     def _diff_get_planes(self):
         """Return (saved_plane, current_plane, z_index) for active Z."""
         state_old = self._diff_get_saved_state(reload=False)
-        state_new = self._diff_state_new
-        if state_old is None or state_new is None:
+        if state_old is None:
             return None
+        state_new = self._diff_state_new
+        reference_active = bool(getattr(self, "_diff_overlay_reference_active", False))
+        reference_masks = self._diff_overlay_reference_masks if reference_active else None
+
         old_masks = np.asarray(state_old.get("masks"))
-        new_masks = np.asarray(state_new.get("masks"))
+
+        if reference_active and isinstance(reference_masks, np.ndarray):
+            new_masks = np.asarray(reference_masks)
+        else:
+            if state_new is None or state_new.get("masks") is None:
+                return None
+            new_masks = np.asarray(state_new.get("masks"))
+
         if old_masks.ndim == 2:
             z_idx = 0
             saved_plane = old_masks
@@ -1447,6 +1532,7 @@ class MainW(QMainWindow):
             "outlines": None,
             "colors": None,
         }
+        self._diff_state_old_manual_override = True
         if self._diff_showing_restored:
             try:
                 self._diff_apply_state(self._diff_state_old, treat_as_new=False)
@@ -1602,11 +1688,14 @@ class MainW(QMainWindow):
             QMessageBox.warning(self, "Diff viewer unavailable",
                                 "Install matplotlib to view segmentation diffs.")
             return
-        if self._diff_seg_path is None or not os.path.exists(self._diff_seg_path):
+        seg_path = self._diff_seg_file()
+        if seg_path is None or not os.path.exists(seg_path):
             QMessageBox.warning(self, "Saved segmentation missing",
                                 "Expected _seg.npy not found for this image.")
             return
-        if self._diff_latest_masks is None:
+        overlay_masks = self._diff_overlay_reference_masks if getattr(self, "_diff_overlay_reference_active", False) else None
+        current_source = overlay_masks if isinstance(overlay_masks, np.ndarray) else self._diff_latest_masks
+        if current_source is None:
             QMessageBox.information(self, "No model result",
                                     "Run a segmentation model before viewing the diff.")
             return
@@ -1615,7 +1704,7 @@ class MainW(QMainWindow):
         if saved_state is None:
             QMessageBox.critical(
                 self, "Failed to load _seg.npy",
-                f"Could not read {os.path.basename(self._diff_seg_path)}.")
+                f"Could not read {os.path.basename(seg_path)}.")
             return
         saved_masks = saved_state.get("masks")
         if saved_masks is None:
@@ -1624,7 +1713,7 @@ class MainW(QMainWindow):
             return
 
         saved_masks = np.squeeze(np.asarray(saved_masks))
-        current_masks = np.squeeze(np.asarray(self._diff_latest_masks))
+        current_masks = np.squeeze(np.asarray(current_source))
 
         def _select_plane(arr, label):
             if arr.ndim == 2:
@@ -1676,6 +1765,8 @@ class MainW(QMainWindow):
                                  f"Contour comparison failed:\n{exc}")
             return
 
+        self._diff_close_existing()
+
         fig, ax = plt.subplots(figsize=(8, 8))
         height, width = diff_rgb.shape[:2]
         im = ax.imshow(
@@ -1704,7 +1795,11 @@ class MainW(QMainWindow):
             fig.canvas.mpl_connect("close_event", self._diff_on_close)
             self._diff_click_cid = fig.canvas.mpl_connect("button_press_event", self._on_diff_click)
             self._diff_scroll_cid = fig.canvas.mpl_connect("scroll_event", self._on_diff_scroll)
-        self._diff_update_crosshair_lines()
+        hub_coords = self._diff_crosshair_hub.current()
+        if hub_coords is not None:
+            self.diff_crosshair_updated(hub_coords, source=None, reason="viewer-open")
+        else:
+            self._diff_update_crosshair_lines(reason="viewer-open")
         fig.show()
         plt.show(block=False)
         self._diff_log("diff viewer open: click magenta to accept saved label, green to accept model label")
@@ -1720,6 +1815,7 @@ class MainW(QMainWindow):
                                     "Model prediction masks are unavailable.")
                 return
             try:
+                self._diff_clear_overlay_reference()
                 self._diff_showing_restored = False
                 self._diff_apply_state(self._diff_state_new, treat_as_new=True)
                 if hasattr(self, "maskToggleButton"):
@@ -2132,6 +2228,9 @@ class MainW(QMainWindow):
         self._diff_drag_active = False
         self._diff_drag_last_update = 0.0
         self._diff_showing_restored = False
+        self._diff_state_old_manual_override = False
+        self._diff_crosshair_suppress_broadcast = False
+        self._diff_clear_overlay_reference()
         if hasattr(self, "diffButton"):
             self.diffButton.setEnabled(False)
         if hasattr(self, "maskToggleButton"):
@@ -2192,6 +2291,7 @@ class MainW(QMainWindow):
         self.update_scale()
         self.update_layer()
         self._refresh_anchor_views()
+        self._diff_note_manual_edit()
 
     def select_cell(self, idx):
         self.prev_selected = self.selected
@@ -2249,6 +2349,7 @@ class MainW(QMainWindow):
             self.ClearButton.setEnabled(False)
         if self.NZ == 1:
             io._save_sets_with_check(self)
+        self._diff_note_manual_edit()
 
 
     def remove_single_cell(self, idx):
@@ -2393,6 +2494,7 @@ class MainW(QMainWindow):
             io._save_sets_with_check(self)
             self.removed_cell = []
             self.redo.setEnabled(False)
+            self._diff_note_manual_edit()
 
     def remove_stroke(self, delete_points=True, stroke_ind=-1):
         stroke = np.array(self.strokes[stroke_ind])
@@ -2508,9 +2610,18 @@ class MainW(QMainWindow):
                         else:
                             coords = (float(y), float(x))
                             self._diff_last_crosshair = coords
-                            self._diff_update_crosshair_lines(coords)
+                            self._diff_update_crosshair_lines(
+                                coords, reason="mouse-drag"
+                            )
                 self._diff_drag_last_update = now
         items = self.win.scene().items(pos)
+
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "_diff_crosshair_hub"):
+                self._diff_crosshair_hub.unregister(self)
+        finally:
+            super().closeEvent(event)
 
     def color_choose(self):
         self.color = self.RGBDropDown.currentIndex()
@@ -2598,6 +2709,7 @@ class MainW(QMainWindow):
                     if self.NZ == 1:
                         # only save after each cell if single image
                         io._save_sets_with_check(self)
+                    self._diff_note_manual_edit()
             else:
                 print("GUI_ERROR: cell too small, not drawn")
             self.current_stroke = []
@@ -3193,3 +3305,5 @@ class MainW(QMainWindow):
                 self.recompute_masks = False
         except Exception as e:
             print("ERROR: %s" % e)
+    def _diff_seg_file(self):
+        return getattr(self, "_diff_seg_path", None)
