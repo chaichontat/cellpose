@@ -156,7 +156,7 @@ class CellposeModel():
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,
              flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
-             flow3D_smooth=0, stitch_threshold=0.0, 
+             flow3D_smooth=0, ortho_weights=None, stitch_threshold=0.0, 
              min_size=15, max_size_fraction=0.4, niter=None, 
              augment=False, tile_overlap=0.1, bsize=256, 
              compute_masks=True, progress=None):
@@ -188,6 +188,8 @@ class CellposeModel():
             cellprob_threshold (float, optional): all pixels with value above threshold kept for masks, decrease to find more and larger masks. Defaults to 0.0.
             do_3D (bool, optional): set to True to run 3D segmentation on 3D/4D image input. Defaults to False.
             flow3D_smooth (int, optional): if do_3D and flow3D_smooth>0, smooth flows with gaussian filter of this stddev. Defaults to 0.
+            ortho_weights (tuple/list of float, optional): optional weights applied to the (XY, YZ, ZX) network passes when
+                aggregating 3D flows. Defaults to None (uniform weighting).
             anisotropy (float, optional): for 3D segmentation, optional rescaling factor (e.g. set to 2.0 if Z is sampled half as dense as X or Y). Defaults to None.
             stitch_threshold (float, optional): if stitch_threshold>0.0 and not do_3D, masks are stitched in 3D to return volume segmentation. Defaults to 0.0.
             min_size (int, optional): all ROIs below this size, in pixels, will be discarded. Defaults to 15.
@@ -249,6 +251,7 @@ class CellposeModel():
                     max_size_fraction=max_size_fraction, 
                     stitch_threshold=stitch_threshold, 
                     flow3D_smooth=flow3D_smooth,
+                    ortho_weights=ortho_weights,
                     progress=progress, 
                     niter=niter)
                 masks.append(maski)
@@ -317,7 +320,8 @@ class CellposeModel():
             tile_overlap=tile_overlap, 
             bsize=bsize,
             do_3D=do_3D, 
-            anisotropy=anisotropy)
+            anisotropy=anisotropy,
+            plane_weights=ortho_weights)
 
         if do_3D:    
             if flow3D_smooth > 0:
@@ -453,7 +457,8 @@ class CellposeModel():
     def _run_net(self, x, 
                 augment=False, 
                 batch_size=8, tile_overlap=0.1,
-                bsize=256, anisotropy=1.0, do_3D=False):
+                bsize=256, anisotropy=1.0, do_3D=False,
+                plane_weights=None):
         """ run network on image x """
         tic = time.time()
         shape = x.shape
@@ -470,7 +475,8 @@ class CellposeModel():
             yf, styles = run_3D(self.net, x,
                                 batch_size=batch_size, augment=augment,  
                                 tile_overlap=tile_overlap, 
-                                bsize=bsize
+                                bsize=bsize,
+                                plane_weights=plane_weights
                                 )
             cellprob = yf[..., -1]
             dP = yf[..., :-1].transpose((3, 0, 1, 2))

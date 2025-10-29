@@ -163,7 +163,7 @@ def _forward(net, x):
 
 
 def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
-            rsz=None):
+            rsz=None, single_tile_if_fit=False):
     """ 
     Run network on stack of images.
     
@@ -193,7 +193,22 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         Lyr, Lxr = Ly0, Lx0
     
     ly, lx = bsize, bsize
+    # default padding matches legacy behavior (ensures >= bsize and multiples of 16 with extra margins)
     ypad1, ypad2, xpad1, xpad2 = transforms.get_pad_yx(Lyr, Lxr, min_size=(bsize, bsize))
+
+    # Optional optimization: if both dimensions can fit in a single tile and we are not
+    # augmenting, avoid the extra 16-pixel padding on X to keep nx=1.
+    if single_tile_if_fit and not augment:
+        # Minimize padding to keep single tile along any dimension that already fits bsize
+        # while preserving 16px alignment and without exceeding bsize.
+        div = 16
+        # Y dimension
+        if Lyr <= bsize:
+            LpadY = (div - (Lyr % div)) % div
+            if Lyr + LpadY <= bsize:
+                ypad1 = LpadY // 2
+                ypad2 = LpadY - ypad1
+        # X dimension: keep legacy pads to preserve tile shapes
     Ly, Lx = Lyr + ypad1 + ypad2, Lxr + xpad1 + xpad2
     pads = np.array([[0, 0], [ypad1, ypad2], [xpad1, xpad2]])
     
@@ -220,7 +235,7 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             imgb = np.pad(imgb.transpose(2,0,1), pads, mode="constant")
             IMG, ysub, xsub, Lyt, Lxt = transforms.make_tiles(
                 imgb, bsize=bsize, augment=augment,
-                tile_overlap=tile_overlap)
+                tile_overlap=(0.0 if (single_tile_if_fit and not augment and Lx <= bsize and Ly <= bsize) else tile_overlap))
             IMGa[i * ntiles : (i+1) * ntiles] = np.reshape(IMG, 
                                             (ny * nx, nchan, ly, lx))
         
@@ -258,7 +273,7 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
 
 def run_3D(net, imgs, batch_size=8, augment=False,
            tile_overlap=0.1, bsize=224, net_ortho=None,
-           progress=None):
+           progress=None, plane_weights=None):
     """ 
     Run network on image z-stack.
     
@@ -287,7 +302,20 @@ def run_3D(net, imgs, batch_size=8, augment=False,
     cpy = [(0, 1), (0, 1), (0, 1)]
     shape = imgs.shape[:-1]
     yf = np.zeros((*shape, 4), "float32")
+    if plane_weights is None:
+        weights = np.ones(3, dtype=np.float32)
+    else:
+        weights = np.asarray(plane_weights, dtype=np.float32)
+        if weights.shape != (3,):
+            raise ValueError("plane_weights must contain three elements for (XY, YZ, ZX).")
+        if np.any(weights < 0):
+            raise ValueError("plane_weights entries must be non-negative.")
+        if np.all(weights == 0):
+            raise ValueError("At least one plane weight must be positive.")
+    flow_weight_totals = np.zeros(3, dtype=np.float32)
+    cellprob_weight_total = 0.0
     for p in range(3):
+        weight = float(weights[p])
         xsl = imgs.transpose(pm[p])
         # per image
         core_logger.info("running %s: %d planes of size (%d, %d)" %
@@ -296,12 +324,20 @@ def run_3D(net, imgs, batch_size=8, augment=False,
                            xsl, batch_size=batch_size, augment=augment, 
                            bsize=bsize, tile_overlap=tile_overlap, 
                            rsz=None)
-        yf[..., -1] += y[..., -1].transpose(ipm[p])
+        yf[..., -1] += weight * y[..., -1].transpose(ipm[p])
+        cellprob_weight_total += weight
         for j in range(2):
-            yf[..., cp[p][j]] += y[..., cpy[p][j]].transpose(ipm[p])
+            axis_idx = cp[p][j]
+            yf[..., axis_idx] += weight * y[..., cpy[p][j]].transpose(ipm[p])
+            flow_weight_totals[axis_idx] += weight
         y = None; del y
-    
+
         if progress is not None:
             progress.setValue(25 + 15 * p)
-    
+    for axis_idx in range(3):
+        if flow_weight_totals[axis_idx] > 0:
+            yf[..., axis_idx] /= flow_weight_totals[axis_idx]
+    if cellprob_weight_total > 0:
+        yf[..., -1] /= cellprob_weight_total
+
     return yf, style
