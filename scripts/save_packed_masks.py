@@ -4,14 +4,15 @@ import numpy as np
 from tifffile import imread
 
 from cellpose import models
-from cellpose.contrib.pack_utils import forward_packed_2d
+from cellpose.contrib.pack_utils import compute_max_guard, forward_packed_2d
 
 
 class PackedCellposeModel(models.CellposeModel):
-    def __init__(self, *args, pack_k: int = 3, pack_guard: int = 16, **kwargs):
+    def __init__(self, *args, pack_k: int = 3, pack_guard: int = 16, pack_border: int = 5, **kwargs):
         super().__init__(*args, **kwargs)
         self._pack_k = pack_k
         self._pack_guard = pack_guard
+        self._pack_border = pack_border
 
     def _run_net(
         self,
@@ -33,6 +34,13 @@ class PackedCellposeModel(models.CellposeModel):
                 anisotropy=anisotropy,
                 do_3D=do_3D,
             )
+        # Choose the largest guard that fits for the desired stripe count K
+        guard_max = compute_max_guard(
+            int(x.shape[1]),
+            bsize=bsize,
+            pack_k=self._pack_k,
+            border=self._pack_border,
+        )
         yf, styles = forward_packed_2d(
             self.net,
             x,
@@ -41,7 +49,8 @@ class PackedCellposeModel(models.CellposeModel):
             augment=augment,
             tile_overlap=tile_overlap,
             pack_k=self._pack_k,
-            guard=self._pack_guard,
+            guard=guard_max,
+            pack_border=self._pack_border,
             return_stats=False,
         )
         cellprob = yf[..., -1]
@@ -84,21 +93,27 @@ def run_model(model, images):
         batch_size=1,
         augment=False,
         tile_overlap=0.0,
+        flow_threshold=0.6
     )
     return model.eval(images, **kwargs)
 
 
 def main():
-    path = Path("/working/20251001_JaxA3_Coro11/analysis/deconv/registered--3r+pi/reg-0076.tif")
+    path = Path("/working/cellpose-training/20251015_JaxA2_Sag7/2/2--reg-0240_orthozx-1244.tif")
     images = prepare_images(path)
     print("Prepared", len(images), "images with shape", images[0].shape, flush=True)
 
     baseline = models.CellposeModel(gpu=True, pretrained_model="/working/cellpose-training/models/embryonicsam")
-    packed = PackedCellposeModel(gpu=True, pretrained_model="/working/cellpose-training/models/embryonicsam")
+    packed = PackedCellposeModel(
+        gpu=True,
+        pretrained_model="/working/cellpose-training/models/embryonicsam",
+        pack_guard=20,
+        pack_border=0,
+    )
 
-    masks_b, _, _ = run_model(baseline, images)
+    masks_b, flows_b, _ = run_model(baseline, images)
     print("Baseline done", flush=True)
-    masks_p, _, _ = run_model(packed, images)
+    masks_p, flows_p, _ = run_model(packed, images)
     print("Packed done", flush=True)
 
     out_dir = Path("/home/chaichontat/mask_comparison")
@@ -109,6 +124,21 @@ def main():
     np.save(out_dir / "images_channel0.npy", images_np)
     np.save(out_dir / "masks_baseline.npy", np.asarray(masks_b))
     np.save(out_dir / "masks_packed.npy", np.asarray(masks_p))
+
+    # Also persist flows for visualization and debugging
+    # flows_* is a list: [rgb (H,W,3), dP (2,H,W), cellprob (H,W)]
+    np.savez_compressed(
+        out_dir / "flows_baseline.npz",
+        rgb=flows_b[0],
+        dP=flows_b[1],
+        cellprob=flows_b[2],
+    )
+    np.savez_compressed(
+        out_dir / "flows_packed.npz",
+        rgb=flows_p[0],
+        dP=flows_p[1],
+        cellprob=flows_p[2],
+    )
     print("Results saved to", out_dir, flush=True)
 
 
