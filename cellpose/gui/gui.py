@@ -222,6 +222,8 @@ class MainW(QMainWindow):
                            border: black solid 1px
                            }"""
         self.loaded = False
+        self._nav_profile = bool(int(os.environ.get("CELLPOSE_NAV_PROFILE", "0")))
+        self._nav_file_cache = None
 
         # ---- MAIN WIDGET LAYOUT ---- #
         self.cwidget = QWidget(self)
@@ -1031,7 +1033,39 @@ class MainW(QMainWindow):
                     self._diff_latest_masks = None
             self._diff_showing_restored = showing_restored
             self._diff_last_crosshair = tuple(crosshair) if crosshair is not None else None
-            self._diff_last_shape = last_shape
+
+            # Clamp cached crosshair to the freshly loaded image size so the
+            # Matplotlib diff cursor stays aligned when tiles have different dims.
+            ly = getattr(self, "Ly", None)
+            lx = getattr(self, "Lx", None)
+            current_shape = None
+            try:
+                if ly is not None and lx is not None:
+                    current_shape = (int(ly), int(lx))
+            except Exception:
+                current_shape = None
+
+            target_shape = None
+            if isinstance(last_shape, (tuple, list)) and len(last_shape) == 2:
+                try:
+                    target_shape = (int(last_shape[0]), int(last_shape[1]))
+                except Exception:
+                    target_shape = None
+
+            if current_shape is not None:
+                self._diff_last_shape = current_shape
+                if (
+                    self._diff_last_crosshair is not None
+                    and current_shape[0] > 0
+                    and current_shape[1] > 0
+                ):
+                    y, x = self._diff_last_crosshair
+                    y = float(np.clip(y, 0, current_shape[0] - 1))
+                    x = float(np.clip(x, 0, current_shape[1] - 1))
+                    self._diff_last_crosshair = (y, x)
+            else:
+                self._diff_last_shape = target_shape
+
             self._diff_z_index = z_index
             if self._diff_last_crosshair is not None:
                 self._diff_update_crosshair_lines(
@@ -1921,16 +1955,74 @@ class MainW(QMainWindow):
             if should_unblock:
                 blocker(False)
 
+    def _should_skip_autosat_on_nav(self) -> bool:
+        """Skip autosaturation recompute during nav; avoids redundant percentile scans."""
+        return True
+
+    def _get_cached_files(self, folder, mask_filter, imf=None, force_refresh=False):
+        """Return image list using a small cache keyed by folder/filter to avoid repeated globbing."""
+        cache = getattr(self, "_nav_file_cache", None)
+        cached_folder = cache.get("folder") if isinstance(cache, dict) else None
+        cached_mask = cache.get("mask_filter") if isinstance(cache, dict) else None
+        cached_imf = cache.get("imf") if isinstance(cache, dict) else None
+        cached_mtime = cache.get("mtime") if isinstance(cache, dict) else None
+
+        mtime = None
+        try:
+            mtime = os.stat(folder).st_mtime
+        except Exception:
+            pass
+
+        cache_stale = (
+            force_refresh
+            or cached_folder != folder
+            or cached_mask != mask_filter
+            or cached_imf != imf
+            or (mtime is not None and cached_mtime is not None and mtime > cached_mtime)
+        )
+
+        if cache_stale or cache is None:
+            images = get_image_files(folder, mask_filter, imf=imf)
+            self._nav_file_cache = {
+                "folder": folder,
+                "mask_filter": mask_filter,
+                "imf": imf,
+                "mtime": mtime,
+                "images": images,
+            }
+        else:
+            images = cache.get("images", [])
+            if not images:
+                images = get_image_files(folder, mask_filter, imf=imf)
+                self._nav_file_cache["images"] = images
+                self._nav_file_cache["mtime"] = mtime
+
+        return images
+
     def get_files(self):
         folder = os.path.dirname(self.filename)
         mask_filter = "_masks"
-        images = get_image_files(folder, mask_filter)
+        images = self._get_cached_files(folder, mask_filter)
         fnames = [os.path.split(images[k])[-1] for k in range(len(images))]
         f0 = os.path.split(self.filename)[-1]
-        idx = np.nonzero(np.array(fnames) == f0)[0][0]
+        matches = np.nonzero(np.array(fnames) == f0)[0]
+        if len(matches) == 0:
+            # Fallback refresh if current file not found (newly added or cache stale)
+            images = self._get_cached_files(folder, mask_filter, force_refresh=True)
+            fnames = [os.path.split(images[k])[-1] for k in range(len(images))]
+            matches = np.nonzero(np.array(fnames) == f0)[0]
+            if len(matches) == 0:
+                raise ValueError(f"ERROR: current file {f0} not found in folder {folder}")
+        idx = matches[0]
         return images, idx
 
     def get_prev_image(self):
+        prof = getattr(self, "_nav_profile", False)
+        t0 = time.perf_counter() if prof else None
+        t_files = t_load = t_after = None
+        target_name = None
+        cache_len = len(self._ortho_cache) if hasattr(self, "_ortho_cache") else None
+
         # Store current view state before loading the new image
         current_view_rect = self.p0.viewRect()
         current_saturation = copy.deepcopy(self.saturation)
@@ -1938,8 +2030,13 @@ class MainW(QMainWindow):
         display_state = self._capture_display_state()
 
         images, idx = self.get_files()
+        if prof:
+            t_files = time.perf_counter()
+        target_name = os.path.basename(images[idx]) if images else None
         idx = (idx - 1) % len(images)
-        io._load_image(self, filename=images[idx])
+        io._load_image(self, filename=images[idx], skip_autosat=self._should_skip_autosat_on_nav())
+        if prof:
+            t_load = time.perf_counter()
 
         try:
             # Restore zoom and position
@@ -1948,35 +2045,63 @@ class MainW(QMainWindow):
             # Restore saturation for the current Z slice
             # Check if the Z index from the previous image is valid for the new image's saturation structure
             if self.currentZ < len(self.saturation[0]) and current_z_index < len(current_saturation[0]):
-                 for r in range(len(self.saturation)):
-                     if r < len(self.saturation) and r < len(current_saturation):
-                         if self.currentZ < len(self.saturation[r]) and current_z_index < len(current_saturation[r]):
-                             self.saturation[r][self.currentZ] = current_saturation[r][current_z_index]
+                for r in range(len(self.saturation)):
+                    if r < len(self.saturation) and r < len(current_saturation):
+                        if self.currentZ < len(self.saturation[r]) and current_z_index < len(current_saturation[r]):
+                            self.saturation[r][self.currentZ] = current_saturation[r][current_z_index]
             else:
-                 print("GUI_WARNING: Z index mismatch or invalid state after loading previous image, applying default/first slice saturation.")
+                print("GUI_WARNING: Z index mismatch or invalid state after loading previous image, applying default/first slice saturation.")
             # Update sliders to reflect restored saturation
             for r_idx, r_name in enumerate(["red", "green", "blue"]):
-                 if r_idx < len(self.saturation) and self.currentZ < len(self.saturation[r_idx]):
-                     self.sliders[r_idx].setValue(self.saturation[r_idx][self.currentZ])
+                if r_idx < len(self.saturation) and self.currentZ < len(self.saturation[r_idx]):
+                    self.sliders[r_idx].setValue(self.saturation[r_idx][self.currentZ])
 
             self._restore_display_state(display_state)
             # Refresh the plot
             self.update_plot()
+            if prof:
+                t_after = time.perf_counter()
         except Exception as e:
             print(f"GUI_ERROR: Could not restore view state: {e}")
             self._restore_display_state(display_state)
-
+            if prof and t_after is None:
+                t_after = time.perf_counter()
+        finally:
+            if prof:
+                now = t_after or time.perf_counter()
+                glob_ms = (t_files - t0) * 1e3 if (t_files is not None and t0 is not None) else None
+                load_ms = (t_load - t_files) * 1e3 if (t_load is not None and t_files is not None) else None
+                update_ms = (now - (t_load if t_load is not None else now)) * 1e3 if t_load is not None else None
+                total_ms = (now - t0) * 1e3 if t0 is not None else None
+                fmt = lambda v: f"{v:.1f}" if v is not None else "n/a"
+                print(
+                    f"NAV_PROFILE prev: glob={fmt(glob_ms)}ms load={fmt(load_ms)}ms "
+                    f"restore+update={fmt(update_ms)}ms total={fmt(total_ms)}ms "
+                    f"file={target_name} ortho={getattr(self, 'is_ortho2D', False)} "
+                    f"stack_ortho={getattr(self, 'ortho_nz', None)} cache={cache_len}",
+                    flush=True,
+                )
 
     def get_next_image(self, load_seg=True):
-         # Store current view state before loading the new image
+        prof = getattr(self, "_nav_profile", False)
+        t0 = time.perf_counter() if prof else None
+        t_files = t_load = t_after = None
+        target_name = None
+        cache_len = len(self._ortho_cache) if hasattr(self, "_ortho_cache") else None
+        # Store current view state before loading the new image
         current_view_rect = self.p0.viewRect()
         current_saturation = copy.deepcopy(self.saturation)
         current_z_index = self.currentZ
         display_state = self._capture_display_state()
 
         images, idx = self.get_files()
+        if prof:
+            t_files = time.perf_counter()
+        target_name = os.path.basename(images[idx]) if images else None
         idx = (idx + 1) % len(images)
-        io._load_image(self, filename=images[idx], load_seg=load_seg)
+        io._load_image(self, filename=images[idx], load_seg=load_seg, skip_autosat=self._should_skip_autosat_on_nav())
+        if prof:
+            t_load = time.perf_counter()
 
         # Restore view state after loading the new image
         try:
@@ -1984,25 +2109,44 @@ class MainW(QMainWindow):
             # Restore saturation for the current Z slice
             # Check if the Z index from the previous image is valid for the new image's saturation structure
             if self.currentZ < len(self.saturation[0]) and current_z_index < len(current_saturation[0]):
-                 for r in range(len(self.saturation)):
-                     # Ensure channel index 'r' is valid for both current and previous saturation lists
-                     if r < len(self.saturation) and r < len(current_saturation):
-                         # Ensure Z indices are valid within their respective saturation lists for this channel
-                         if self.currentZ < len(self.saturation[r]) and current_z_index < len(current_saturation[r]):
-                             self.saturation[r][self.currentZ] = current_saturation[r][current_z_index]
+                for r in range(len(self.saturation)):
+                    # Ensure channel index 'r' is valid for both current and previous saturation lists
+                    if r < len(self.saturation) and r < len(current_saturation):
+                        # Ensure Z indices are valid within their respective saturation lists for this channel
+                        if self.currentZ < len(self.saturation[r]) and current_z_index < len(current_saturation[r]):
+                            self.saturation[r][self.currentZ] = current_saturation[r][current_z_index]
             else:
-                 print("GUI_WARNING: Z index mismatch or invalid state after loading next image, applying default/first slice saturation.")
+                print("GUI_WARNING: Z index mismatch or invalid state after loading next image, applying default/first slice saturation.")
 
             # Update sliders to reflect restored saturation
             for r_idx, r_name in enumerate(["red", "green", "blue"]):
-                 if r_idx < len(self.saturation) and self.currentZ < len(self.saturation[r_idx]):
-                     self.sliders[r_idx].setValue(self.saturation[r_idx][self.currentZ])
+                if r_idx < len(self.saturation) and self.currentZ < len(self.saturation[r_idx]):
+                    self.sliders[r_idx].setValue(self.saturation[r_idx][self.currentZ])
 
             self._restore_display_state(display_state)
             self.update_plot()
+            if prof:
+                t_after = time.perf_counter()
         except Exception as e:
             print(f"GUI_ERROR: Could not restore view state: {e}")
             self._restore_display_state(display_state)
+            if prof and t_after is None:
+                t_after = time.perf_counter()
+        finally:
+            if prof:
+                now = t_after or time.perf_counter()
+                glob_ms = (t_files - t0) * 1e3 if (t_files is not None and t0 is not None) else None
+                load_ms = (t_load - t_files) * 1e3 if (t_load is not None and t_files is not None) else None
+                update_ms = (now - (t_load if t_load is not None else now)) * 1e3 if t_load is not None else None
+                total_ms = (now - t0) * 1e3 if t0 is not None else None
+                fmt = lambda v: f"{v:.1f}" if v is not None else "n/a"
+                print(
+                    f"NAV_PROFILE next: glob={fmt(glob_ms)}ms load={fmt(load_ms)}ms "
+                    f"restore+update={fmt(update_ms)}ms total={fmt(total_ms)}ms "
+                    f"file={target_name} ortho={getattr(self, 'is_ortho2D', False)} "
+                    f"stack_ortho={getattr(self, 'ortho_nz', None)} cache={cache_len}",
+                    flush=True,
+                )
 
 
     def dragEnterEvent(self, event):

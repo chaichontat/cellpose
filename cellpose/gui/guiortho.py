@@ -18,6 +18,7 @@ import pyqtgraph as pg
 import numpy as np
 from scipy.stats import mode
 import cv2
+import os
 
 from . import guiparts, menus, io
 from .. import models, core, dynamics, version
@@ -146,7 +147,8 @@ class MainW_ortho2D(MainW):
         self.orthobtn = QCheckBox("ortho")
         self.orthobtn.setToolTip("activate orthoviews using Z-stack from folder")
         self.orthobtn.setFont(self.medfont)
-        self.orthobtn.setChecked(False) # Off by default
+        self.orthobtn.setChecked(False)
+        self._auto_enable_ortho = True
         self.l0.addWidget(self.orthobtn, ortho_row_start, 0, 1, 2)
         self.orthobtn.toggled.connect(self.toggle_ortho)
 
@@ -215,6 +217,30 @@ class MainW_ortho2D(MainW):
         """ Override base _load_image to call the ortho version. """
         self._load_image_ortho2D(filename=filename, load_seg=load_seg)
 
+    def get_prev_image(self):
+        # Try ortho reuse first
+        images, idx = self.get_files()
+        idx = (idx - 1) % len(images)
+        target_file = images[idx]
+        can_reuse, target_idx = self._ortho_can_reuse(target_file)
+        if can_reuse and target_idx is not None:
+            if self._ortho_reuse_slice(target_idx):
+                self.filename = target_file
+                return
+        super().get_prev_image()
+
+    def get_next_image(self, load_seg=True):
+        # Try ortho reuse first
+        images, idx = self.get_files()
+        idx = (idx + 1) % len(images)
+        target_file = images[idx]
+        can_reuse, target_idx = self._ortho_can_reuse(target_file)
+        if can_reuse and target_idx is not None:
+            if self._ortho_reuse_slice(target_idx):
+                self.filename = target_file
+                return
+        super().get_next_image(load_seg=load_seg)
+
     def _load_image_ortho2D(self, filename=None, load_seg=True):
         """ Loads the main 2D image and then finds/loads the Z-stack. """
         if filename is None:
@@ -252,38 +278,82 @@ class MainW_ortho2D(MainW):
         print(f"GUI_INFO: Loaded main 2D image: {self.filename}")
         print(f"GUI_INFO: Main stack shape: {self.stack.shape}, NZ={self.ortho_nz}, nchan={self.nchan}") # Should be NZ=1
 
-        # 2. Find and load the Z-stack based on filename pattern
+        # 2. Find and load the Z-stack based on filename pattern (only when ortho is enabled)
         self.stack_ortho = None
         self.ortho_nz = 0
         self.zc_ortho = 0
         self._ortho_seg_warned = False
+        if getattr(self, "_auto_enable_ortho", False) and not self.orthobtn.isChecked():
+            try:
+                blocker = getattr(self.orthobtn, "blockSignals", None)
+                if callable(blocker):
+                    blocker(True)
+                self.orthobtn.setChecked(True)
+            finally:
+                if callable(blocker):
+                    blocker(False)
+            self._auto_enable_ortho = False
+        if self.orthobtn.isChecked():
+            self._load_ortho_stack_only(filename)
+        else:
+            print("GUI_INFO: Ortho disabled; skipping Z-stack loading.")
+            self.stack_ortho = None
+            self.ortho_files_sorted = []
+            self.ortho_used_z_indices = []
 
+        # 3. Finalize setup
+        # Update saturation array length if NZ_ortho changed
+
+        # Initialize ortho view position to center of main image
+        self.yortho = self.Ly // 2
+        self.xortho = self.Lx // 2
+
+        # Update UI elements
+        self.enable_buttons() # Re-enable buttons after load
+        self.update_layer()   # Update mask layer display
+        self.update_scale()   # Update scale disk
+
+        # Toggle ortho views on if checkbox is checked
+        if self.orthobtn.isChecked():
+            self.add_orthoviews()
+            self.update_ortho()
+
+    def _load_ortho_stack_only(self, filename: str):
+        """Load only the ortho stack for the current filename; main image must already be loaded."""
         try:
             from pathlib import Path
             filepath = Path(filename)
-            # Split into stem and suffix
             basename = filepath.stem
             ext = filepath.suffix
+            folder = filepath.parent
 
             # Try to find Z index using supported patterns:
-            #   (1) basename_z<idx>.<ext>  e.g., sample_z05.tif
-            #   (2) basename-<idx>.<ext>   e.g., sample-5.tif
-            folder = filepath.parent
+            #   underscore: basename_z<idx>.<ext>
+            #   dash:       basename-<idx>.<ext>
+            #   double-dash underscore: family--<id>_z<idx>.<ext>
             m_z = re.match(r'^(.*)_z(\d+)$', basename)
             m_dash = re.match(r'^(.*)-(\d+)$', basename)
-            if m_z or m_dash:
+            # allow arbitrary id between the double dashes before _z##
+            m_ddash = re.match(r'^(.*)--(.+)_z(\d+)$', basename)
+            if m_z or m_dash or m_ddash:
                 if m_z:
                     family = m_z.group(1)
                     main_z_index = int(m_z.group(2))
                     glob_glob = f"{family}_z*{ext}"
                     stem_regex = re.compile(rf'^{re.escape(family)}_z(\d+)$')
                     pattern_tag = "underscore"
-                else:
+                elif m_dash:
                     family = m_dash.group(1)
                     main_z_index = int(m_dash.group(2))
                     glob_glob = f"{family}-*{ext}"
                     stem_regex = re.compile(rf'^{re.escape(family)}-(\d+)$')
                     pattern_tag = "dash"
+                else:
+                    family = m_ddash.group(1) + "--" + m_ddash.group(2)
+                    main_z_index = int(m_ddash.group(3))
+                    glob_glob = f"{family}_z*{ext}"
+                    stem_regex = re.compile(rf'^{re.escape(family)}_z(\d+)$')
+                    pattern_tag = "ddash_z"
                 glob_pattern = str(folder / glob_glob)
                 print(f"GUI_INFO: Globbing for Z-stack: {glob_pattern}")
 
@@ -297,10 +367,10 @@ class MainW_ortho2D(MainW):
                         z_files_dict[z_idx] = str(fpath)
 
                 if not z_files_dict:
-                     print("GUI_WARNING: No Z-stack files found matching pattern.")
-                     self.ortho_nz = 1
-                     self.stack_ortho = self.stack.copy() # Use main stack as ortho stack
-                     self.zc_ortho = 0
+                    print("GUI_WARNING: No Z-stack files found matching pattern.")
+                    self.ortho_nz = 1
+                    self.stack_ortho = self.stack.copy()  # Use main stack as ortho stack
+                    self.zc_ortho = 0
                 else:
                     cache_key = (str(folder.resolve()), pattern_tag, family, ext.lower())
                     if getattr(self, "_ortho_cache_key", None) != cache_key:
@@ -308,12 +378,10 @@ class MainW_ortho2D(MainW):
                         self._ortho_cache = OrderedDict()
                         self._ortho_cache_shape = None
 
-                    # Sort files by Z-index
                     sorted_z = sorted(z_files_dict.keys())
                     sorted_files = [z_files_dict[z] for z in sorted_z]
                     print(f"GUI_INFO: Found {len(sorted_files)} Z-planes: {sorted_z}")
 
-                    # Restrict loading to +/- 20 frames around the central index to avoid loading full stacks
                     half_span = 20
                     try:
                         center_pos = sorted_z.index(main_z_index)
@@ -326,7 +394,6 @@ class MainW_ortho2D(MainW):
                     sorted_z = sorted_z[lo:hi]
                     sorted_files = sorted_files[lo:hi]
 
-                    # Load images into a list first to check dimensions
                     images = []
                     used_files = []
                     used_z_indices = []
@@ -385,9 +452,7 @@ class MainW_ortho2D(MainW):
                         self.stack_ortho = self.stack.copy()
                         self.zc_ortho = 0
                     else:
-                        # Stack images into numpy array
-                        self.stack_ortho = np.stack(images, axis=0) # (NZ, Ly, Lx, C)
-
+                        self.stack_ortho = np.stack(images, axis=0)  # (NZ, Ly, Lx, C)
                         img_min = self.stack_ortho.min()
                         img_max = self.stack_ortho.max()
                         self.stack_ortho = self.stack_ortho.astype(np.float32)
@@ -396,15 +461,13 @@ class MainW_ortho2D(MainW):
                             self.stack_ortho /= (img_max - img_min)
                         self.stack_ortho *= 255
                         self.ortho_nz = self.stack_ortho.shape[0]
-                        # Keep file list aligned with stacked images
-                        self.ortho_files_sorted = used_files
+                        # Normalize to absolute posix-like strings to avoid separator/case mismatches on lookup
+                        self.ortho_files_sorted = [Path(f).resolve().as_posix() for f in used_files]
                         self.ortho_used_z_indices = used_z_indices
                         print(self.stack_ortho.min(), self.stack_ortho.max())
 
                         if self.stack_ortho.shape[-1] != 3:
                             self.stack_ortho = np.concatenate((self.stack_ortho, np.zeros((self.stack_ortho.shape[0], self.stack_ortho.shape[1], self.stack_ortho.shape[2], 1), dtype=self.stack_ortho.dtype)), axis=-1)
-                        #   self.NZ = self.stack_ortho.shape[0]
-                        # Find the Z-index of the main loaded image
                         try:
                             self.zc_ortho = used_z_indices.index(main_z_index)
                         except ValueError:
@@ -413,9 +476,9 @@ class MainW_ortho2D(MainW):
                         print(f"GUI_INFO: Ortho stack loaded. Shape={self.stack_ortho.shape}, Main Z index={self.zc_ortho}")
 
             else:
-                print("GUI_WARNING: Filename does not match expected Z-stack pattern (basename_z##.ext or basename-#.ext). Cannot load ortho stack.")
+                print("GUI_WARNING: Filename does not match expected Z-stack pattern (basename_z##.ext, basename-#.ext, or *--*_z#.ext). Cannot load ortho stack.")
                 self.ortho_nz = 1
-                self.stack_ortho = self.stack.copy() # Use main stack
+                self.stack_ortho = self.stack.copy()  # Use main stack
                 self.zc_ortho = 0
                 self.ortho_files_sorted = []
 
@@ -425,23 +488,6 @@ class MainW_ortho2D(MainW):
             self.stack_ortho = self.stack.copy() if self.stack is not None else None
             self.zc_ortho = 0
             self.ortho_files_sorted = []
-
-        # 3. Finalize setup
-        # Update saturation array length if NZ_ortho changed
-
-        # Initialize ortho view position to center of main image
-        self.yortho = self.Ly // 2
-        self.xortho = self.Lx // 2
-
-        # Update UI elements
-        self.enable_buttons() # Re-enable buttons after load
-        self.update_layer()   # Update mask layer display
-        self.update_scale()   # Update scale disk
-
-        # Toggle ortho views on if checkbox is checked
-        if self.orthobtn.isChecked():
-            self.add_orthoviews()
-            self.update_ortho()
 
 
     def make_orthoviews(self):
@@ -880,9 +926,88 @@ class MainW_ortho2D(MainW):
     def toggle_ortho(self):
         """ Toggles the visibility of the orthographic views. """
         if self.orthobtn.isChecked():
+            self._auto_enable_ortho = False
+            if (self.stack_ortho is None or getattr(self, "ortho_nz", 0) == 0) and getattr(self, "filename", None):
+                self._load_ortho_stack_only(self.filename)
             self.add_orthoviews()
         else:
+            # Clear ortho state and remove views
+            self.stack_ortho = None
+            self.ortho_files_sorted = []
+            self.ortho_used_z_indices = []
+            self.ortho_nz = 0
             self.remove_orthoviews()
+
+    # --- OrtHo-aware navigation (override base) ---
+    def _ortho_can_reuse(self, target_file: str) -> tuple[bool, int | None]:
+        """Return (can_reuse, target_idx) if target file is in the current ortho stack and shapes match."""
+        if not getattr(self, "orthobtn", None) or not self.orthobtn.isChecked():
+            return False, None
+        if not self._ensure_ortho_stack_loaded():
+            return False, None
+        files = getattr(self, "ortho_files_sorted", None)
+        if not isinstance(files, list) or len(files) == 0:
+            return False, None
+        try:
+            target_norm = Path(target_file).resolve().as_posix()
+            files_norm = self.ortho_files_sorted
+            target_idx = files_norm.index(target_norm)
+        except Exception:
+            return False, None
+        # Shape must match current main plane
+        if self.stack_ortho.shape[1:3] != (self.Ly, self.Lx):
+            return False, None
+        return True, target_idx
+
+    def _ortho_reuse_slice(self, target_idx: int):
+        """Reuse an already cached ortho slice as the main image without reloading from disk."""
+        try:
+            slice_img = self.stack_ortho[target_idx]
+        except Exception as exc:
+            print(f"GUI_WARNING: Failed to reuse cached ortho slice {target_idx}: {exc}")
+            return False
+
+        # Update primary stack to this slice (shape Ly x Lx x C)
+        self.stack = np.expand_dims(slice_img, axis=0).astype(np.float32, copy=False)
+        self.NZ = 1
+        self.currentZ = 0
+        self.Ly, self.Lx = self.stack.shape[-3:-1]
+        self.layerz = 255 * np.ones((self.Ly, self.Lx, 4), "uint8")
+        self.layer = getattr(self, "layer", None)
+        if self.layer is not None:
+            self.layer.setImage(self.layerz)
+        # Keep saturation arrays consistent
+        if isinstance(getattr(self, "saturation", None), list) and len(self.saturation) >= 1:
+            for c in range(len(self.saturation)):
+                if len(self.saturation[c]) == 0:
+                    self.saturation[c] = [[0, 255]]
+                elif len(self.saturation[c]) > 1:
+                    self.saturation[c] = [self.saturation[c][self.currentZ]]
+        self.zc_ortho = target_idx
+        self._zi_start = None  # force window recompute
+        self.update_crosshairs()
+        self.update_plot()
+        return True
+
+    def _ensure_ortho_stack_loaded(self) -> bool:
+        """Ensure orthoview stack is present; load minimal fallback if not."""
+        if getattr(self, "stack_ortho", None) is not None and getattr(self, "ortho_nz", 0) > 0:
+            return True
+        if not getattr(self, "orthobtn", None) or not self.orthobtn.isChecked():
+            return False
+        if getattr(self, "filename", None):
+            try:
+                self._load_ortho_stack_only(self.filename)
+            except Exception as exc:
+                print(f"GUI_WARNING: Failed to load ortho stack on demand: {exc}")
+        if getattr(self, "stack_ortho", None) is None:
+            if getattr(self, "stack", None) is not None:
+                self.stack_ortho = self.stack.copy()
+                self.ortho_nz = 1
+                self.ortho_files_sorted = [self.filename] if getattr(self, "filename", None) else []
+            else:
+                self.ortho_nz = 0
+        return getattr(self, "stack_ortho", None) is not None and getattr(self, "ortho_nz", 0) > 0
 
 
     def plot_clicked(self, event):

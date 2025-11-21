@@ -1,7 +1,7 @@
 """
 Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer , Michael Rariden and Marius Pachitariu.
 """
-import os, gc
+import os, gc, time
 import numpy as np
 import cv2
 import fastremap
@@ -117,10 +117,17 @@ def _get_train_set(image_names):
     return train_data, train_labels, train_files, restore, normalize_params
 
 
-def _load_image(parent, filename=None, load_seg=True, load_3D=False):
+def _load_image(parent, filename=None, load_seg=True, load_3D=False, skip_autosat=False):
     """ load image with filename; if None, open QFileDialog
     if image is grey change view to default to grey scale 
     """
+
+    profile = bool(int(os.environ.get("CELLPOSE_LOAD_PROFILE", "0")))
+    t_marks = {}
+    def mark(label):
+        if profile:
+            t_marks[label] = time.perf_counter()
+    mark("start")
 
     cache_before = getattr(parent, "_diff_cache_before_image_change", None)
     if callable(cache_before):
@@ -161,6 +168,7 @@ def _load_image(parent, filename=None, load_seg=True, load_3D=False):
             image = imread_2D(filename)
         else:
             image = imread_3D(filename)
+        mark("read")
         parent.loaded = True
     except Exception as e:
         print("ERROR: images not compatible")
@@ -170,11 +178,13 @@ def _load_image(parent, filename=None, load_seg=True, load_3D=False):
         parent.reset()
         parent.filename = filename
         filename = os.path.split(parent.filename)[-1]
-        _initialize_images(parent, image, load_3D=load_3D)
+        _initialize_images(parent, image, load_3D=load_3D, skip_autosat=skip_autosat)
+        mark("init")
         parent.loaded = True
         parent.enable_buttons()
         if load_mask:
             _load_masks(parent, filename=mask_file)
+            mark("masks")
 
         cache_after = getattr(parent, "_diff_restore_after_image_load", None)
         if callable(cache_after):
@@ -182,15 +192,34 @@ def _load_image(parent, filename=None, load_seg=True, load_3D=False):
                 cache_after()
             except Exception as exc:
                 print(f"GUI_WARNING: diff state restore after load failed: {exc}")
+        mark("post_load")
 
     # check if gray and adjust viewer:
     if len(np.unique(image[..., 1:])) == 1:
         parent.color = 4
         parent.RGBDropDown.setCurrentIndex(4) # gray
         parent.update_plot()
+    mark("end")
+
+    if profile:
+        def delta(a, b):
+            if a in t_marks and b in t_marks:
+                return (t_marks[b] - t_marks[a]) * 1e3
+            return None
+        read_ms = delta("start", "read")
+        init_ms = delta("read", "init") or delta("start", "init")
+        masks_ms = delta("init", "masks")
+        post_ms = delta("masks" if "masks" in t_marks else "init", "end")
+        total_ms = delta("start", "end")
+        fmt = lambda v: f"{v:.1f}" if v is not None else "n/a"
+        print(
+            f"LOAD_PROFILE: read={fmt(read_ms)}ms init={fmt(init_ms)}ms "
+            f"masks={fmt(masks_ms)}ms finish={fmt(post_ms)}ms total={fmt(total_ms)}ms",
+            flush=True,
+        )
 
         
-def _initialize_images(parent, image, load_3D=False):
+def _initialize_images(parent, image, load_3D=False, skip_autosat=False):
     """ format image for GUI
 
     assumes image is Z x W x H x C
@@ -238,7 +267,7 @@ def _initialize_images(parent, image, load_3D=False):
         print("GUI_INFO: no 'img_restore' found, applying current settings")
         parent.compute_restore()
 
-    if parent.autobtn.isChecked():
+    if parent.autobtn.isChecked() and not skip_autosat:
         if parent.restore is None or parent.restore != "filter":
             print(
                 "GUI_INFO: normalization checked: computing saturation levels (and optionally filtered image)"
