@@ -811,8 +811,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               lr_schedule: str = "cosine",
               warmup_epochs: int = 10,
               cosine_hold_epochs: int | None = None,
-              cosine_min_lr: float | None = None,
-              diameter: float | None = None
+              cosine_min_lr: float | None = None
               ):
     """
     Train the network with images for segmentation.
@@ -955,7 +954,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     else:
         kwargs = {"normalize_params": normalize_params, "channel_axis": channel_axis}
 
-    net.diam_labels.data = torch.Tensor([diam_train.mean() if diameter is None else diameter]).to(device)
+    net.diam_labels.data = torch.Tensor([diam_train.mean()]).to(device)
 
     env_debug_dir = os.environ.get("CELLPOSE_SAVE_SCALED_DIR")
     if debug_save_scaled_dir is None:
@@ -1066,8 +1065,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                                     files=train_files, labels_files=train_labels_files,
                                     **kwargs)
             diams = np.array([diam_train[i] for i in inds])
-            if diameter is not None:
-                diams = diameter * np.ones_like(diams)
             rsc = diams / net.diam_mean.item() if rescale else np.ones(
                 len(diams), "float32")
 
@@ -1156,8 +1153,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                                                 labels_files=test_labels_files,
                                                 **kwargs)
                         diams = np.array([diam_test[i] for i in inds])
-                        if diameter is not None:
-                            diams = diameter * np.ones_like(diams)
                         rsc = diams / net.diam_mean.item() if rescale else np.ones(
                             len(diams), "float32")
 

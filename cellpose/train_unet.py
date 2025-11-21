@@ -459,7 +459,6 @@ def train_seg(
     warmup_epochs: int = 10,
     cosine_hold_epochs: int | None = None,
     cosine_min_lr: float | None = None,
-    diameter: float | None = None,
 ):
     """
     Train the network with images for segmentation.
@@ -735,8 +734,6 @@ def train_seg(
                 **kwargs,
             )
             diams = np.array([diam_train[i] for i in inds])
-            if diameter is not None:
-                diams = diameter * np.ones_like(diams)
             rsc = (
                 diams / net.diam_mean.item()
                 if rescale
@@ -822,8 +819,6 @@ def train_seg(
                             **kwargs,
                         )
                         diams = np.array([diam_test[i] for i in inds])
-                        if diameter is not None:
-                            diams = diameter * np.ones_like(diams)
                         rsc = (
                             diams / net.diam_mean.item()
                             if rescale
