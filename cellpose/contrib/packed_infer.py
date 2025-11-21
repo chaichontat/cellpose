@@ -317,6 +317,7 @@ class PackedCellposeUNetModel(Packed3DMixin, CellposeUNetModel):
         bsize=224,
         anisotropy=1.0,
         do_3D=False,
+        plane_weights=None,
     ):
         if self._should_use_packing(do_3D, anisotropy):
             return self._run_packed_3d(
@@ -327,7 +328,7 @@ class PackedCellposeUNetModel(Packed3DMixin, CellposeUNetModel):
                 tile_overlap=tile_overlap,
                 bsize=bsize,
                 anisotropy=anisotropy,
-                plane_weights=None,
+                plane_weights=plane_weights,
             )
         return super()._run_net(
             x,
@@ -339,6 +340,7 @@ class PackedCellposeUNetModel(Packed3DMixin, CellposeUNetModel):
             bsize=bsize,
             anisotropy=anisotropy,
             do_3D=do_3D,
+            plane_weights=plane_weights,
         )
 
 
@@ -439,6 +441,7 @@ class CellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
         bsize=224,
         anisotropy=1.0,
         do_3D=False,
+        plane_weights=None,
     ):
         return super()._run_net(
             x,
@@ -450,4 +453,5 @@ class CellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
             bsize=bsize,
             anisotropy=anisotropy,
             do_3D=do_3D,
+            plane_weights=plane_weights,
         )

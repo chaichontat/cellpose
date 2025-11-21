@@ -433,7 +433,7 @@ class CellposeUNetModel:
              min_size: int = 15, max_size_fraction: float = 0.4, niter: Optional[int] = None,
              augment: bool = False, tile_overlap: float = 0.1, bsize: int = 224,
              interp: bool = True, compute_masks: bool = True, progress=None,
-             flow3D_smooth: int = 0):
+             flow3D_smooth: int = 0, ortho_weights: Optional[Sequence[float]] = None):
         if isinstance(x, list) or x.squeeze().ndim == 5:
             self.timing = []
             masks, styles, flows = [], [], []
@@ -457,7 +457,7 @@ class CellposeUNetModel:
                     do_3D=do_3D, anisotropy=anisotropy, augment=augment,
                     tile_overlap=tile_overlap, bsize=bsize, resample=resample,
                     flow_threshold=flow_threshold, cellprob_threshold=cellprob_threshold,
-                    compute_masks=compute_masks, min_size=min_size,
+                    compute_masks=compute_masks, min_size=min_size, ortho_weights=ortho_weights,
                     max_size_fraction=max_size_fraction, stitch_threshold=stitch_threshold,
                     progress=progress, niter=niter)
                 masks.append(maski)
@@ -520,7 +520,8 @@ class CellposeUNetModel:
         dP, cellprob, styles = self._run_net(
             x, rescale=rescale_args, resample=resample, augment=augment,
             batch_size=batch_size, tile_overlap=tile_overlap,
-            bsize=bsize, anisotropy=anisotropy, do_3D=do_3D)
+            bsize=bsize, anisotropy=anisotropy, do_3D=do_3D,
+            plane_weights=ortho_weights)
 
         if do_3D:
             if flow3D_smooth > 0:
@@ -563,7 +564,8 @@ class CellposeUNetModel:
 
     def _run_net(self, x, rescale=1.0, resample=True, augment=False,
                  batch_size=8, tile_overlap=0.1,
-                 bsize=224, anisotropy=1.0, do_3D=False):
+                 bsize=224, anisotropy=1.0, do_3D=False,
+                 plane_weights: Optional[Sequence[float]] = None):
         tic = time.time()
         shape = x.shape
         nimg = shape[0]
@@ -603,7 +605,7 @@ class CellposeUNetModel:
                 tile_overlap=tile_overlap,
                 bsize=bsize,
                 net_ortho=self.net_ortho,
-                plane_weights=None,
+                plane_weights=plane_weights,
             )
             cellprob = yf[..., -1]
             dP = yf[..., :-1].transpose((3, 0, 1, 2))
