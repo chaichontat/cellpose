@@ -1,4 +1,6 @@
 import time
+import datetime
+import json
 import os
 import numpy as np
 from typing import Callable, Optional
@@ -6,6 +8,7 @@ from cellpose import io, utils, models, dynamics
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from cellpose.contrib.pack_utils import compute_stripe_layout, compute_max_guard, pack_planes_to_stripes
 from pathlib import Path
+from .schedules import build_lr_schedule
 import torch
 from torch import nn
 from tqdm import trange
@@ -52,7 +55,7 @@ def _resolve_pack_stripe_height(
     if max_h is not None:
         candidate = min(candidate, max_h)
     candidate = min(int(candidate), int(bsize))
-    
+
     layout = compute_stripe_layout(
         candidate,
         bsize=bsize,
@@ -804,7 +807,13 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               pack_stripe_border: int = _PACK_STRIPE_BORDER,
               debug_save_scaled_dir: str | os.PathLike[str] | None = None,
               debug_save_scaled_limit: int = 32,
-              batch_photom_augment: Optional[Callable[[np.ndarray], np.ndarray]] = None):
+              batch_photom_augment: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+              lr_schedule: str = "cosine",
+              warmup_epochs: int = 10,
+              cosine_hold_epochs: int | None = None,
+              cosine_min_lr: float | None = None,
+              diameter: float | None = None
+              ):
     """
     Train the network with images for segmentation.
 
@@ -946,7 +955,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     else:
         kwargs = {"normalize_params": normalize_params, "channel_axis": channel_axis}
 
-    net.diam_labels.data = torch.Tensor([diam_train.mean()]).to(device)
+    net.diam_labels.data = torch.Tensor([diam_train.mean() if diameter is None else diameter]).to(device)
 
     env_debug_dir = os.environ.get("CELLPOSE_SAVE_SCALED_DIR")
     if debug_save_scaled_dir is None:
@@ -977,20 +986,18 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     nimg_test_per_epoch = nimg_test if nimg_test_per_epoch is None else nimg_test_per_epoch
 
     # learning rate schedule
-    LR = np.linspace(0, learning_rate, 10)
-    LR = np.append(LR, learning_rate * np.ones(max(0, n_epochs - 10)))
-    if n_epochs > 300:
-        LR = LR[:-100]
-        for i in range(10):
-            LR = np.append(LR, LR[-1] / 2 * np.ones(10))
-    elif n_epochs > 99:
-        LR = LR[:-50]
-        for i in range(10):
-            LR = np.append(LR, LR[-1] / 2 * np.ones(5))
+    LR = build_lr_schedule(
+        n_epochs,
+        learning_rate,
+        schedule=lr_schedule,
+        warmup_epochs=warmup_epochs,
+        hold_epochs=cosine_hold_epochs,
+        min_lr=cosine_min_lr,
+    )
 
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
     train_logger.info(
-        f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}"
+        f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}, lr_schedule={lr_schedule}, warmup_epochs={warmup_epochs}, hold_epochs={cosine_hold_epochs}, final_lr={LR[-1]:0.5f}"
     )
     optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate,
                                     weight_decay=weight_decay)
@@ -1003,6 +1010,38 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     (save_path / "models").mkdir(exist_ok=True)
 
     train_logger.info(f">>> saving model to {filename}")
+
+    # training report setup
+    logs_dir = save_path / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    start_ts = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    report_path = logs_dir / f"{model_name}-{start_ts}.jsonl"
+    try:
+        with open(report_path, "w", encoding="utf-8") as rf:
+            start_payload = {
+                "type": "start",
+                "started_at": start_ts,
+                "model_name": model_name,
+                "model_path": str(filename),
+                "device": str(device),
+                "optimizer": "AdamW",
+                "learning_rate": float(learning_rate),
+                "weight_decay": float(weight_decay),
+                "n_epochs": int(n_epochs),
+                "batch_size": int(batch_size),
+                "bsize": int(bsize),
+                "lr_schedule": lr_schedule,
+                "warmup_epochs": int(warmup_epochs),
+                "cosine_hold_epochs": None if cosine_hold_epochs is None else int(cosine_hold_epochs),
+                "cosine_min_lr": None if cosine_min_lr is None else float(cosine_min_lr),
+                "final_lr": float(LR[-1]) if len(LR) else None,
+                "train_files": list(map(str, train_files)) if train_files is not None else None,
+                "test_files": list(map(str, test_files)) if test_files is not None else None,
+            }
+            rf.write(json.dumps(start_payload, ensure_ascii=False) + "\n")
+        train_logger.info(f"Training report: {report_path}")
+    except Exception as _e:
+        train_logger.warning(f"could not create training report at {report_path}: {_e}")
 
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
@@ -1027,6 +1066,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                                     files=train_files, labels_files=train_labels_files,
                                     **kwargs)
             diams = np.array([diam_train[i] for i in inds])
+            if diameter is not None:
+                diams = diameter * np.ones_like(diams)
             rsc = diams / net.diam_mean.item() if rescale else np.ones(
                 len(diams), "float32")
 
@@ -1094,7 +1135,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                     pack_guard_effective,
                 )
 
-        if iepoch == 5 or iepoch % 10 == 0:
+        # Log metrics every epoch instead of sparsely
+        if True:
             lavgt = 0.
             if test_data is not None or test_files is not None:
                 np.random.seed(42)
@@ -1114,6 +1156,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                                                 labels_files=test_labels_files,
                                                 **kwargs)
                         diams = np.array([diam_test[i] for i in inds])
+                        if diameter is not None:
+                            diams = diameter * np.ones_like(diams)
                         rsc = diams / net.diam_mean.item() if rescale else np.ones(
                             len(diams), "float32")
 
@@ -1171,9 +1215,29 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                             )
                 test_losses[iepoch] = lavgt
             lavg /= nsum
+            elapsed = time.time() - t0
             train_logger.info(
-                f"{iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
+                f"{iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {elapsed:.2f}s"
             )
+            # append to training report each epoch (JSONL)
+            try:
+                with open(report_path, "a", encoding="utf-8") as rf:
+                    rf.write(
+                        json.dumps(
+                            {
+                                "type": "epoch",
+                                "epoch": int(iepoch + 1),
+                                "lr": float(LR[iepoch]),
+                                "train_loss": float(lavg),
+                                "test_loss": float(lavgt),
+                                "elapsed_seconds": float(elapsed),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            except Exception as _e:
+                train_logger.warning(f"could not update training report at {report_path}: {_e}")
             lavg, nsum = 0, 0
 
         if iepoch == n_epochs - 1 or (iepoch % save_every == 0 and iepoch != 0):
@@ -1185,6 +1249,23 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             net.save_model(filename0)
 
     net.save_model(filename)
+    # write summary footer with total training time (JSONL)
+    try:
+        total_elapsed = time.time() - t0
+        with open(report_path, "a", encoding="utf-8") as rf:
+            rf.write(
+                json.dumps(
+                    {
+                        "type": "end",
+                        "ended_at": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                        "total_elapsed_seconds": float(total_elapsed),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
 
     if original_net_dtype is not None:
         net.dtype = original_net_dtype

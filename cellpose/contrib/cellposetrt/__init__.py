@@ -150,18 +150,16 @@ class CellposeModelTRT(models.CellposeModel):
 
     def __init__(
         self,
-        gpu=False,
-        pretrained_model="cyto2",
+        pretrained_model,
+        gpu=True,
         model_type=None,
         diam_mean=None,
         device=None,
         nchan=None,
         use_bfloat16=True,
-        engine_path=None,
     ):
         super().__init__(
             gpu=gpu,
-            pretrained_model=pretrained_model,
             model_type=model_type,
             diam_mean=diam_mean,
             device=device,
@@ -171,9 +169,7 @@ class CellposeModelTRT(models.CellposeModel):
         dev = torch.device("cuda" if device is None else device)
         if not use_bfloat16:
             raise ValueError("CellposeModelTRT only supports use_bfloat16=True")
-        if engine_path is None:
-            raise ValueError("engine_path must be provided for CellposeModelTRT")
-        self.net = TRTEngineModule(engine_path, device=dev)
+        self.net = TRTEngineModule(pretrained_model, device=dev)
 
     def eval(self, x, **kwargs):
         if kwargs.get("bsize", 256) != self.net._in_dims[2]:

@@ -72,6 +72,9 @@ def get_arg_parser():
     model_args.add_argument(
         "--add_model", required=False, default=None, type=str,
         help="model path to copy model to hidden .cellpose folder for using in GUI/CLI")
+    model_args.add_argument(
+        "--model_backend", choices=("sam", "unet"), default="sam",
+        help="select segmentation backbone: 'sam' (default) or the UNet from Cellpose 3")
     # TODO: remove deprecated in future version
     model_args.add_argument("--restore_type", required=False, default=None, type=str, help=
         'Deprecated in v4.0.1+, not used. ')
@@ -199,6 +202,33 @@ def get_arg_parser():
     )
     training_args.add_argument("--learning_rate", default=1e-5, type=float,
                                help="learning rate. Default: %(default)s")
+    training_args.add_argument(
+        "--warmup_epochs",
+        default=10,
+        type=int,
+        help="number of warmup epochs for LR schedule. Default: %(default)s",
+    )
+    training_args.add_argument(
+        "--cosine_hold_epochs",
+        default=None,
+        type=int,
+        help="epochs to hold at peak LR before cosine decay (None => ~50% of total).",
+    )
+    training_args.add_argument(
+        "--cosine_min_lr",
+        default=None,
+        type=float,
+        help="minimum LR at end of cosine decay (absolute). None => 1% of base LR",
+    )
+    training_args.add_argument(
+        "--lr_schedule",
+        default="cosine",
+        choices=["cosine", "step"],
+        help=(
+            "learning rate schedule: 'cosine' (warmup+cosine) or 'step' (warmup+flat+halvings). "
+            "Default: %(default)s"
+        ),
+    )
     training_args.add_argument("--weight_decay", default=0.1, type=float,
                                help="weight decay. Default: %(default)s")
     training_args.add_argument("--n_epochs", default=100, type=int,

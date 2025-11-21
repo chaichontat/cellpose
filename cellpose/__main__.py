@@ -5,6 +5,11 @@ import os, time
 import numpy as np
 from tqdm import tqdm
 from cellpose import utils, models, io, train
+from cellpose.unet import (
+    CellposeUNetModel as LegacyCellposeModel,
+    MODEL_NAMES as LEGACY_MODEL_NAMES,
+    get_user_models as legacy_get_user_models,
+)
 from .version import version_str
 from cellpose.cli import get_arg_parser
 
@@ -82,6 +87,10 @@ def main():
     else:
         pretrained_model = args.pretrained_model
 
+    if args.model_backend == "unet" and pretrained_model == "cpsam":
+        logger.info("legacy UNet backend selected; defaulting pretrained model to 'cyto3'")
+        pretrained_model = "cyto3"
+
         restore_type = args.restore_type
         if restore_type is not None:
             try:
@@ -110,8 +119,12 @@ def main():
         model_type = None
         if pretrained_model and not os.path.exists(pretrained_model):
             model_type = pretrained_model if pretrained_model is not None else "cyto3"
-            model_strings = models.get_user_models()
-            all_models = models.MODEL_NAMES.copy()
+            if args.model_backend == "unet":
+                model_strings = legacy_get_user_models()
+                all_models = list(LEGACY_MODEL_NAMES)
+            else:
+                model_strings = models.get_user_models()
+                all_models = models.MODEL_NAMES.copy()
             all_models.extend(model_strings)
             if ~np.any([model_type == s for s in all_models]):
                 model_type = default_model
@@ -134,6 +147,12 @@ def main():
     ## Train a model ##
     else:
         _train_cellposemodel_cli(args, logger, image_filter, device, pretrained_model, normalize)
+
+
+def _select_model_cls(backend: str):
+    if backend == "unet":
+        return LegacyCellposeModel
+    return models.CellposeModel
 
 
 def _train_cellposemodel_cli(args, logger, image_filter, device, pretrained_model, normalize):
@@ -159,8 +178,8 @@ def _train_cellposemodel_cli(args, logger, image_filter, device, pretrained_mode
         images, labels, image_names, test_images, test_labels, image_names_test = output
         load_files = True
 
-    # initialize model
-    model = models.CellposeModel(device=device, pretrained_model=pretrained_model)
+    model_cls = _select_model_cls(args.model_backend)
+    model = model_cls(device=device, pretrained_model=pretrained_model)
 
     # train segmentation model
     cpmodel_path = train.train_seg(
@@ -178,7 +197,12 @@ def _train_cellposemodel_cli(args, logger, image_filter, device, pretrained_mode
             save_path=os.path.realpath(args.dir),
             save_every=args.save_every,
             save_each=args.save_each,
-            model_name=args.model_name_out)[0]
+            model_name=args.model_name_out,
+            lr_schedule=args.lr_schedule,
+            warmup_epochs=args.warmup_epochs,
+            cosine_hold_epochs=args.cosine_hold_epochs,
+            cosine_min_lr=args.cosine_min_lr,
+            )[0]
     model.pretrained_model = cpmodel_path
     logger.info(">>>> model trained and saved to %s" % cpmodel_path)
     return model
@@ -208,8 +232,8 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
     logger.info(
             ">>>> running cellpose on %d images using all channels" % nimg)
 
-    # handle built-in model exceptions
-    model = models.CellposeModel(device=device, pretrained_model=pretrained_model,)
+    model_cls = _select_model_cls(args.model_backend)
+    model = model_cls(device=device, pretrained_model=pretrained_model)
 
     tqdm_out = utils.TqdmToLogger(logger, level=logging.INFO)
 

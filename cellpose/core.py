@@ -145,6 +145,9 @@ def _from_device(X):
 def _forward(net, x):
     """Converts images to torch tensors, runs the network model, and returns numpy arrays.
 
+    More robust dtype handling: falls back to the dtype of the first parameter
+    if the module does not expose a `dtype` attribute (e.g., CPnet).
+
     Args:
         net (torch.nn.Module): The network model.
         x (numpy.ndarray): The input images.
@@ -152,7 +155,14 @@ def _forward(net, x):
     Returns:
         Tuple[numpy.ndarray, numpy.ndarray]: The output predictions (flows and cellprob) and style features.
     """
-    X = _to_device(x, device=net.device, dtype=net.dtype)
+    try:
+        dtype = net.dtype
+    except Exception:
+        try:
+            dtype = next(net.parameters()).dtype
+        except Exception:
+            dtype = torch.float32
+    X = _to_device(x, device=net.device, dtype=dtype)
     net.eval()
     with torch.no_grad():
         y, style = net(X)[:2]

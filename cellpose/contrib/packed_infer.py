@@ -7,6 +7,7 @@ import numpy as np
 from cellpose import models, transforms
 from cellpose.contrib.cellposetrt import CellposeModelTRT as _CellposeModelTRT
 from cellpose.core import run_net
+from cellpose.unet import CellposeUNetModel
 
 from .pack_utils import (
     compute_max_guard,
@@ -282,4 +283,171 @@ class PackedCellposeModelTRT(Packed3DMixin, _CellposeModelTRT):
             anisotropy=anisotropy,
             do_3D=do_3D,
             plane_weights=plane_weights,
+        )
+
+
+class PackedCellposeUNetModel(Packed3DMixin, CellposeUNetModel):
+    """UNet model with packed 3D ortho paths; 2D path unchanged."""
+
+    def __init__(
+        self,
+        *args,
+        pack_z_stripes: bool = True,
+        pack_k: int = 3,
+        pack_guard: int = 16,
+        pack_min_Ly: int = 1,
+        pack_border: int = 5,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._pack_enabled = bool(pack_z_stripes)
+        self._pack_k = int(pack_k)
+        self._pack_guard = int(pack_guard)
+        self._pack_min_Ly = int(pack_min_Ly)
+        self._pack_border = int(pack_border)
+
+    def _run_net(
+        self,
+        x,
+        rescale=1.0,
+        resample=True,
+        augment=False,
+        batch_size=8,
+        tile_overlap=0.1,
+        bsize=224,
+        anisotropy=1.0,
+        do_3D=False,
+    ):
+        if self._should_use_packing(do_3D, anisotropy):
+            return self._run_packed_3d(
+                self.net,
+                x,
+                batch_size=batch_size,
+                augment=augment,
+                tile_overlap=tile_overlap,
+                bsize=bsize,
+                anisotropy=anisotropy,
+                plane_weights=None,
+            )
+        return super()._run_net(
+            x,
+            rescale=rescale,
+            resample=resample,
+            augment=augment,
+            batch_size=batch_size,
+            tile_overlap=tile_overlap,
+            bsize=bsize,
+            anisotropy=anisotropy,
+            do_3D=do_3D,
+        )
+
+
+class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
+    """UNet model using TRTEngineModule plus packed 3D ortho paths."""
+
+    def __init__(
+        self,
+        *args,
+        pretrained_model: str,
+        device=None,
+        pack_z_stripes: bool = True,
+        pack_k: int = 3,
+        pack_guard: int = 16,
+        pack_min_Ly: int = 1,
+        pack_border: int = 5,
+        **kwargs,
+    ):
+        super().__init__(*args, device=device, **kwargs)
+        from cellpose.contrib.cellposetrt import TRTEngineModule
+        dev = device if device is not None else self.device
+        self.net = TRTEngineModule(pretrained_model, device=dev)
+        self._pack_enabled = bool(pack_z_stripes)
+        self._pack_k = int(pack_k)
+        self._pack_guard = int(pack_guard)
+        self._pack_min_Ly = int(pack_min_Ly)
+        self._pack_border = int(pack_border)
+
+    def _run_net(
+        self,
+        x,
+        rescale=1.0,
+        resample=True,
+        augment=False,
+        batch_size=8,
+        tile_overlap=0.1,
+        bsize=224,
+        anisotropy=1.0,
+        do_3D=False,
+    ):
+        if self._should_use_packing(do_3D, anisotropy):
+            return self._run_packed_3d(
+                self.net,
+                x,
+                batch_size=batch_size,
+                augment=augment,
+                tile_overlap=tile_overlap,
+                bsize=bsize,
+                anisotropy=anisotropy,
+                plane_weights=None,
+            )
+        return super()._run_net(
+            x,
+            rescale=rescale,
+            resample=resample,
+            augment=augment,
+            batch_size=batch_size,
+            tile_overlap=tile_overlap,
+            bsize=bsize,
+            anisotropy=anisotropy,
+            do_3D=do_3D,
+        )
+
+
+class CellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
+    """UNet model using TRTEngineModule plus packed 3D ortho paths."""
+
+    def __init__(
+        self,
+        *args,
+        pretrained_model: str,
+        device=None,
+        pack_z_stripes: bool = True,
+        pack_k: int = 3,
+        pack_guard: int = 16,
+        pack_min_Ly: int = 1,
+        pack_border: int = 5,
+        **kwargs,
+    ):
+        super().__init__(*args, device=device, **kwargs)
+        from cellpose.contrib.cellposetrt import TRTEngineModule
+        dev = device if device is not None else self.device
+        self.net = TRTEngineModule(pretrained_model, device=dev)
+        self._pack_enabled = bool(pack_z_stripes)
+        self._pack_k = int(pack_k)
+        self._pack_guard = int(pack_guard)
+        self._pack_min_Ly = int(pack_min_Ly)
+        self._pack_border = int(pack_border)
+
+    def _run_net(
+        self,
+        x,
+        rescale=1.0,
+        resample=True,
+        augment=False,
+        batch_size=8,
+        tile_overlap=0.1,
+        bsize=224,
+        anisotropy=1.0,
+        do_3D=False,
+    ):
+        return super()._run_net(
+            x,
+            rescale=rescale,
+            resample=resample,
+            augment=augment,
+            batch_size=batch_size,
+            tile_overlap=tile_overlap,
+            bsize=bsize,
+            anisotropy=anisotropy,
+            do_3D=do_3D,
         )

@@ -931,9 +931,13 @@ def train(net, train_data=None, train_labels=None, train_files=None, test_data=N
 
     learning_rate_const = learning_rate
     LR = np.linspace(0, learning_rate_const, 10)
-    LR = np.append(LR, learning_rate_const * np.ones(n_epochs - 100))
-    for i in range(10):
-        LR = np.append(LR, LR[-1] / 2 * np.ones(10))
+    # reserve last 50 epochs for five halvings (5x10) and keep total length == n_epochs
+    if n_epochs > 60:
+        LR = np.append(LR, learning_rate_const * np.ones(n_epochs - 60))
+        for i in range(5):
+            LR = np.append(LR, LR[-1] / 2 * np.ones(10))
+    else:
+        LR = np.append(LR, learning_rate_const * np.ones(max(0, n_epochs - 10)))
     learning_rate = LR
 
     batch_size = 8
@@ -1311,9 +1315,11 @@ def seg_train_noisy(model, train_data, train_labels, test_data=None, test_labels
         if SGD:
             LR = np.linspace(0, model.learning_rate_const, 10)
             if model.n_epochs > 250:
+                # reserve last 50 epochs for five halvings (5x10); keep total length == n_epochs
                 LR = np.append(
-                    LR, model.learning_rate_const * np.ones(model.n_epochs - 100))
-                for i in range(10):
+                    LR, model.learning_rate_const * np.ones(max(0, model.n_epochs - 60))
+                )
+                for i in range(5):
                     LR = np.append(LR, LR[-1] / 2 * np.ones(10))
             else:
                 LR = np.append(
