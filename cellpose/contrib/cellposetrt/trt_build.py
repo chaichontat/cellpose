@@ -40,6 +40,7 @@ import tensorrt as trt
 import torch
 
 from cellpose import models
+from cellpose.unet import CellposeUNetModel
 
 
 class _CPNetWrapper(torch.nn.Module):
@@ -57,18 +58,38 @@ class _CPNetWrapper(torch.nn.Module):
         return y, style
 
 
-def export_onnx(pretrained_model: str, onnx_out: str, *, batch_size: int, bsize: int, opset: int = 20):
-    device = torch.device("cuda")
-    model = models.CellposeModel(gpu=True, pretrained_model=pretrained_model, use_bfloat16=True)
-    net = model.net.to(device).eval()
-
-    # Ensure weights are BF16 as expected
+def _load_model(pretrained_model: str, backend: str, device: torch.device):
+    if backend == "sam":
+        model = models.CellposeModel(
+            gpu=True,
+            pretrained_model=pretrained_model,
+            use_bfloat16=True,
+            device=device,
+        )
+        net = model.net.to(device=device, dtype=torch.bfloat16).eval()
+        nchan = 3
+    elif backend == "unet":
+        model = CellposeUNetModel(
+            gpu=True,
+            pretrained_model=pretrained_model,
+            device=device,
+        )
+        net = model.net.to(device=device, dtype=torch.bfloat16).eval()
+        nchan = model.nchan
+    else:
+        raise ValueError(f"Unsupported backend '{backend}'")
     param_dtypes = {p.dtype for p in net.parameters()}
-    if torch.float32 in param_dtypes:
-        raise RuntimeError(f"Loaded model contains FP32 parameters: {param_dtypes}. Expected BF16 only.")
+    if param_dtypes != {torch.bfloat16}:
+        raise RuntimeError(f"Model parameters must be bfloat16, found {param_dtypes}")
+    return net, nchan
+
+
+def export_onnx(pretrained_model: str, onnx_out: str, *, batch_size: int, bsize: int, opset: int, backend: str):
+    device = torch.device("cuda")
+    net, nchan = _load_model(pretrained_model, backend, device)
     wrapper = _CPNetWrapper(net)
 
-    dummy = torch.randn(batch_size, 3, bsize, bsize, device=device, dtype=torch.bfloat16)
+    dummy = torch.randn(batch_size, nchan, bsize, bsize, device=device, dtype=torch.bfloat16)
     Path(os.path.dirname(onnx_out) or ".").mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
         torch.onnx.export(
@@ -152,13 +173,27 @@ def main():
     ap.add_argument("--batch-size", type=int, default=1, help="Max batch dimension N (engine supports dynamic [1..N])")
     ap.add_argument("--bsize", type=int, default=256, help="Tile size (256x256 by default)")
     ap.add_argument("--opset", type=int, default=20, help="ONNX opset version to use for export")
+    ap.add_argument("--backend", choices=("sam", "unet"), default="sam", help="Segmentation backbone to export")
     args = ap.parse_args()
 
     plan_path = args.output
     p = Path(plan_path)
     onnx_out = str(p.with_suffix(".onnx"))
-    export_onnx(args.pretrained_model, onnx_out, batch_size=args.batch_size, bsize=args.bsize, opset=args.opset)
-    build_engine(onnx_out, plan_path, batch_size=args.batch_size, bsize=args.bsize, vram=args.vram)
+    export_onnx(
+        args.pretrained_model,
+        onnx_out,
+        batch_size=args.batch_size,
+        bsize=args.bsize,
+        opset=args.opset,
+        backend=args.backend,
+    )
+    build_engine(
+        onnx_out,
+        plan_path,
+        batch_size=args.batch_size,
+        bsize=args.bsize,
+        vram=args.vram,
+    )
 
 
 if __name__ == "__main__":
