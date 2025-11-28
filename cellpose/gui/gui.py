@@ -2,30 +2,48 @@
 Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer, Michael Rariden and Marius Pachitariu.
 """
 
-import sys, os, pathlib, warnings, datetime, time, copy
-
 import copy
-from qtpy import QtGui, QtCore
-from superqt import QRangeSlider, QCollapsible
-from qtpy.QtWidgets import QScrollArea, QMainWindow, QApplication, QWidget, QScrollBar, \
-    QComboBox, QGridLayout, QPushButton, QFrame, QCheckBox, QLabel, QProgressBar, \
-        QLineEdit, QMessageBox, QGroupBox
-import pyqtgraph as pg
+import datetime
+import os
+import pathlib
+import sys
+import time
+import warnings
 
-import numpy as np
 import cv2
+import numpy as np
+import pyqtgraph as pg
+from qtpy import QtCore, QtGui
+from qtpy.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QScrollBar,
+    QWidget,
+)
+from superqt import QCollapsible, QRangeSlider
 
-from . import guiparts, menus, io
-from .diffhooks import note_manual_edit
-from .diffcache import DiffStateCache
-from .diffcrosshair import DiffCrosshairHub
-from .. import models, core, dynamics, version, train
-from ..utils import download_url_to_file, masks_to_outlines, diameters
-from ..io import get_image_files, imsave, imread
-from ..transforms import resize_image, normalize99, normalize99_tile, smooth_sharpen_img
+from .. import core, dynamics, models, train, version
+from ..contrib.diff import contour_diff_rgb
+from ..io import get_image_files, imread, imsave
 from ..models import normalize_default
 from ..plot import disk
-from ..contrib.diff import contour_diff_rgb
+from ..transforms import normalize99, normalize99_tile, resize_image, smooth_sharpen_img
+from ..utils import diameters, download_url_to_file, masks_to_outlines
+from . import guiparts, io, menus
+from .diffcache import DiffStateCache
+from .diffcrosshair import DiffCrosshairHub
+from .diffhooks import note_manual_edit
 
 try:
     import matplotlib.pyplot as plt
@@ -3199,7 +3217,7 @@ class MainW(QMainWindow):
         if model_name is None or custom:
             self.get_model_path(custom=custom)
             if not os.path.exists(self.current_model_path):
-                raise ValueError("need to specify model (use dropdown)")
+                raise ValueError("Model file not found: need to specify model (use dropdown)")
 
         if model_name is None or not isinstance(model_name, str):
             self.model = models.CellposeModel(gpu=self.useGPU.isChecked(),
@@ -3301,7 +3319,7 @@ class MainW(QMainWindow):
                 self.logger.error("Flows don't exist, try running model again.")
                 return
 
-            maski = dynamics.resize_and_compute_masks(
+            maski = dynamics.compute_masks_and_clean(
                 dP=dP,
                 cellprob=cellprob,
                 niter=niter,
