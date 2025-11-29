@@ -1,16 +1,16 @@
 """TensorRT-backed Cellpose model module.
 
-  TensorRT is NVIDIA's neural‑network inference compiler/runtime for NVIDIA GPUs. It takes
-  an ONNX/graph, picks optimized kernels, fuses layers, and plans memory/scheduling
-  specialized for a given GPU architecture and fixed input profile.
+TensorRT is NVIDIA's neural‑network inference compiler/runtime for NVIDIA GPUs. It takes
+an ONNX/graph, picks optimized kernels, fuses layers, and plans memory/scheduling
+specialized for a given GPU architecture and fixed input profile.
 
-  By specializing for fixed input shapes and fusing ops, TensorRT can deliver
-  higher performance than standard PyTorch inference (1.7x speedup in RTX 5090).
-  A CellposeSAM model can be converted to the TensorRT format by running
-  cellpose/contrib/cellposetrt/trt_build.py.
+By specializing for fixed input shapes and fusing ops, TensorRT can deliver
+higher performance than standard PyTorch inference (1.7x speedup in RTX 5090).
+A CellposeSAM model can be converted to the TensorRT format by running
+cellpose/contrib/cellposetrt/trt_build.py.
 
-  `CellposeModelTRT(engine_path=...)` in this module is a drop-in replacement for
-  the standard `CellposeModel` to run CellposeSAM via TensorRT.
+`CellposeModelTRT(engine_path=...)` in this module is a drop-in replacement for
+the standard `CellposeModel` to run CellposeSAM via TensorRT.
 """
 
 import tensorrt as trt
@@ -29,6 +29,7 @@ class TRTEngineModule(torch.nn.Module):
     - Requires TensorRT >= 10.
     - Engines are compiled for fixed profiles batch size and tile size.
     """
+
     def __init__(self, engine_path: str, device=torch.device("cuda")):
         super().__init__()
 
@@ -79,8 +80,10 @@ class TRTEngineModule(torch.nn.Module):
         self.dtype = self._dtype_in
 
         # Detect fixed batch dimension from engine input shape (None if dynamic)
-        self._in_dims = tuple(self._engine.get_tensor_shape(self._name_in))  # (N,C,H,W) with -1 for dynamic dims
-        self._fixedN = self._in_dims[0] if self._in_dims[0]> 0 else None
+        self._in_dims = tuple(
+            self._engine.get_tensor_shape(self._name_in)
+        )  # (N,C,H,W) with -1 for dynamic dims
+        self._fixedN = self._in_dims[0] if self._in_dims[0] > 0 else None
 
     def forward(self, X: torch.Tensor):
         if not X.is_cuda:
@@ -157,21 +160,49 @@ class CellposeModelTRT(models.CellposeModel):
         device=None,
         nchan=None,
         use_bfloat16=True,
+        pretrained_model_ortho=None,
     ):
         super().__init__(
             gpu=gpu,
+            pretrained_model=pretrained_model,
             model_type=model_type,
             diam_mean=diam_mean,
             device=device,
             nchan=nchan,
             use_bfloat16=True,
+            pretrained_model_ortho=pretrained_model_ortho,
         )
         dev = torch.device("cuda" if device is None else device)
         if not use_bfloat16:
             raise ValueError("CellposeModelTRT only supports use_bfloat16=True")
-        self.net = TRTEngineModule(pretrained_model, device=dev)
+
+        # Base class defers .plan loading (self.net=None); load as TRT or error if PyTorch.
+        if self.net is None:
+            # Base class deferred loading for .plan file - load as TRT engine
+            self.net = TRTEngineModule(pretrained_model, device=dev)
+        else:
+            # Base class loaded PyTorch model, but CellposeModelTRT requires TRT
+            raise ValueError(
+                f"CellposeModelTRT requires a .plan TRT engine file, got: {pretrained_model}"
+            )
+
+        # Ortho: .plan->TRT, .pth->PyTorch (hybrid), or None.
+        if self.pretrained_model_ortho is not None:
+            if self.pretrained_model_ortho.endswith(".plan"):
+                # Load TRT engine for ortho model (full TRT mode)
+                self.net_ortho = TRTEngineModule(
+                    self.pretrained_model_ortho, device=dev
+                )
+            elif self.net_ortho is None:
+                # Base class didn't load it (shouldn't happen for .pth files)
+                raise ValueError(
+                    f"Ortho model path provided but not loaded: {self.pretrained_model_ortho}. "
+                    f"Expected either .plan TRT file or PyTorch checkpoint."
+                )
 
     def eval(self, x, **kwargs):
         if kwargs.get("bsize", 256) != self.net._in_dims[2]:
-            raise ValueError(f"This engine only supports bsize={self.net._in_dims[2]} (built with this bsize)")
+            raise ValueError(
+                f"This engine only supports bsize={self.net._in_dims[2]} (built with this bsize)"
+            )
         return super().eval(x, **kwargs)

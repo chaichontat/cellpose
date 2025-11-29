@@ -12,11 +12,10 @@ from torch import nn
 from tqdm import trange
 
 from cellpose import dynamics, io, models, transforms, utils
-from cellpose.contrib.pack_utils import compute_max_guard
-from cellpose.transforms import normalize_img, random_rotate_and_resize
 from cellpose.train import (
     _prepare_dimension_packed_batch as _prepare_packed_batch,
     _resolve_pack_stripe_height as _resolve_pack_height,
+    _compute_min_effective_height,
 )
 
 train_logger = logging.getLogger(__name__)
@@ -453,7 +452,7 @@ def train_seg(
     pack_to_single_tile=False,
     pack_k=3,
     pack_guard=16,
-    pack_stripe_height=68,
+    pack_stripe_height: int | None = None,
     pack_stripe_border=0,
     lr_schedule: str = "cosine",
     warmup_epochs: int = 10,
@@ -495,10 +494,13 @@ def train_seg(
         min_train_masks (int, optional): Integer - minimum number of masks an image must have to use in the training set. Defaults to 5.
         model_name (str, optional): String - name of the network. Defaults to None.
         batch_photom_augment (Callable, optional): Photometric augmentation applied to the batch after geometric transforms. Defaults to None.
-        pack_to_single_tile (bool, optional): Enable stripe packing for thin tiles. Defaults to False.
-        pack_k (int, optional): Maximum number of stripes to pack into one tile. Defaults to 3.
-        pack_guard (int, optional): Guard pixels between packed stripes. Defaults to 16.
-        pack_stripe_height (int, optional): Preferred stripe height before packing. Defaults to 68.
+        pack_to_single_tile (bool, optional): Enable stripe packing for thin tiles. K is auto-selected
+            to maximize packing while ensuring guard >= 5. Defaults to False.
+        pack_k (int, optional): DEPRECATED - K is now auto-selected. This parameter is ignored.
+        pack_guard (int, optional): DEPRECATED - guard is now auto-computed. This parameter is ignored.
+        pack_stripe_height (int or None, optional): Preferred stripe height before packing. Defaults to None,
+            which uses the smallest effective training image height across the dataset. Provide an explicit
+            integer to override.
         pack_stripe_border (int, optional): Border padding (pixels) above/below each stripe. Defaults to 0.
 
     Returns:
@@ -577,8 +579,9 @@ def train_seg(
             "rgb": rgb,
         }
 
+    diam_mean = float(diam_train.mean())
     net.diam_labels.data = torch.tensor(
-        [diam_train.mean()],
+        [diam_mean],
         device=device,
         dtype=net.dtype,
     )
@@ -663,47 +666,63 @@ def train_seg(
 
     phot_aug = batch_photom_augment
 
-    pack_guard_effective = max(0, int(pack_guard))
+    pack_k_effective: int = 1
+    pack_guard_effective: int = 0
     pack_border_effective = max(0, int(pack_stripe_border))
     pack_height_effective: int | None = None
 
-    if pack_to_single_tile and pack_k > 1:
+    if pack_to_single_tile:
+        min_eff_h = _compute_min_effective_height(train_data, diam_train, diam_mean)
+        stripe_h = int(min_eff_h) if pack_stripe_height is None else pack_stripe_height
+        train_logger.info(
+            "Min effective training image height: %.1f px, using stripe_h=%d",
+            min_eff_h,
+            stripe_h,
+        )
+
         pack_height_effective, auto_adjusted = _resolve_pack_height(
-            pack_stripe_height,
-            pack_k=pack_k,
-            guard=pack_guard_effective,
+            stripe_h,
             bsize=bsize,
             border=pack_border_effective,
+            max_height=int(min_eff_h),
         )
         if pack_height_effective is None:
             train_logger.warning(
-                "Packing requested but no valid stripe height fits pack_k=%d guard=%d within bsize=%d; disabling packing.",
-                pack_k,
-                pack_guard_effective,
+                "Packing requested but no valid stripe height fits within bsize=%d; disabling packing.",
                 bsize,
             )
             pack_to_single_tile = False
         else:
-            pack_guard_effective = compute_max_guard(
+            from cellpose.contrib.pack_utils import compute_stripe_layout
+
+            layout = compute_stripe_layout(
                 pack_height_effective,
                 bsize=bsize,
-                pack_k=pack_k,
                 border=pack_border_effective,
             )
-            train_logger.info(
-                "Packed training enabled: stripe_h=%d (+%d border), k=%d, guard=%d, bsize=%d",
-                pack_height_effective,
-                pack_border_effective,
-                pack_k,
-                pack_guard_effective,
-                bsize,
-            )
-            if auto_adjusted:
-                train_logger.info(
-                    "Auto-adjusted stripe height to %d for packing (requested=%s).",
+            if layout is None:
+                train_logger.warning(
+                    "Packing layout unavailable for stripe_h=%d; disabling packing.",
                     pack_height_effective,
-                    pack_stripe_height,
                 )
+                pack_to_single_tile = False
+            else:
+                pack_k_effective = layout.K
+                pack_guard_effective = layout.guard
+                train_logger.info(
+                    "Packed training enabled: stripe_h=%d (+%d border), K=%d (auto), guard=%d, bsize=%d",
+                    pack_height_effective,
+                    pack_border_effective,
+                    pack_k_effective,
+                    pack_guard_effective,
+                    bsize,
+                )
+                if auto_adjusted:
+                    train_logger.info(
+                        "Auto-adjusted stripe height to %d for packing (requested=%s).",
+                        pack_height_effective,
+                        pack_stripe_height,
+                    )
 
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
@@ -747,8 +766,6 @@ def train_seg(
                 bsize=bsize,
                 pack_enabled=pack_to_single_tile,
                 pack_height=pack_height_effective,
-                pack_k=pack_k,
-                pack_guard=pack_guard_effective,
                 pack_border=pack_border_effective,
                 phot_aug=phot_aug,
             )
@@ -776,19 +793,19 @@ def train_seg(
 
         if (
             pack_to_single_tile
-            and pack_k > 1
+            and pack_k_effective > 1
             and pack_height_effective is not None
             and (packed_tiles_epoch + std_tiles_epoch) > 0
         ):
             train_logger.info(
-                "Epoch %d packing stats — packed_tiles=%d, standard_tiles=%d (stripe_h=%d, border=%d, guard=%d, k=%d)",
+                "Epoch %d packing stats — packed_tiles=%d, standard_tiles=%d (stripe_h=%d, border=%d, guard=%d, K=%d)",
                 iepoch + 1,
                 packed_tiles_epoch,
                 std_tiles_epoch,
                 pack_height_effective,
                 pack_border_effective,
                 pack_guard_effective,
-                pack_k,
+                pack_k_effective,
             )
 
         # Log metrics every epoch instead of sparsely
@@ -832,8 +849,6 @@ def train_seg(
                             bsize=bsize,
                             pack_enabled=pack_to_single_tile,
                             pack_height=pack_height_effective,
-                            pack_k=pack_k,
-                            pack_guard=pack_guard_effective,
                             pack_border=pack_border_effective,
                         )
                         if result is None:
@@ -850,18 +865,18 @@ def train_seg(
                 lavgt /= len(rperm)
                 if (
                     pack_to_single_tile
-                    and pack_k > 1
+                    and pack_k_effective > 1
                     and pack_height_effective is not None
                     and (packed_tiles_eval + std_tiles_eval) > 0
                 ):
                     train_logger.info(
-                        "Eval packing stats — packed_tiles=%d, standard_tiles=%d (stripe_h=%d, border=%d, guard=%d, k=%d)",
+                        "Eval packing stats — packed_tiles=%d, standard_tiles=%d (stripe_h=%d, border=%d, guard=%d, K=%d)",
                         packed_tiles_eval,
                         std_tiles_eval,
                         pack_height_effective,
                         pack_border_effective,
                         pack_guard_effective,
-                        pack_k,
+                        pack_k_effective,
                     )
                 test_losses[iepoch] = lavgt
             lavg /= nsum
@@ -920,4 +935,3 @@ def train_seg(
         pass
 
     return filename, train_losses, test_losses
-

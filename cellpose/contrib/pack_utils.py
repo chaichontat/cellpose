@@ -20,29 +20,54 @@ class StripeLayout:
     bsize: int
 
 
+MIN_GUARD = 5
+
+
 def compute_stripe_layout(
     Ly: int,
     *,
     bsize: int = 256,
-    pack_k: int = 3,
-    guard: int = 16,
     border: int = 0,
 ) -> StripeLayout | None:
+    """Auto-select K to maximize packing while ensuring guard >= MIN_GUARD.
+
+    Parameters
+    ----------
+    Ly : int
+        Height of each data stripe (in pixels) before border padding.
+    bsize : int
+        Size of the square tile used for packing.
+    border : int
+        Pixels of padding applied above and below each stripe.
+
+    Returns
+    -------
+    StripeLayout or None
+        Layout configuration, or None if packing with guard >= MIN_GUARD is not possible.
+    """
     if Ly <= 0 or bsize <= 0:
         raise ValueError(f"Invalid dimensions Ly={Ly}, bsize={bsize}")
-    guard = max(0, int(guard))
     border = max(0, int(border))
     slot_height = Ly + 2 * border
     if slot_height <= 0:
         return None
+
+    # Find largest K where guard >= MIN_GUARD
+    # Constraint: K * slot_height + (K-1) * MIN_GUARD <= bsize
     Kmax = 1
-    for K in range(2, max(2, int(pack_k)) + 1):
-        if K * slot_height + (K - 1) * guard <= bsize:
+    for K in range(2, 10):  # reasonable upper bound
+        required = K * slot_height + (K - 1) * MIN_GUARD
+        if required <= bsize:
             Kmax = K
         else:
             break
+
     if Kmax < 2:
-        return None
+        return None  # Can't pack with guard >= MIN_GUARD
+
+    # Compute actual guard (maximize it)
+    guard = (bsize - Kmax * slot_height) // (Kmax - 1)
+
     starts = tuple(i * (slot_height + guard) for i in range(Kmax))
     return StripeLayout(
         K=Kmax,
@@ -55,54 +80,16 @@ def compute_stripe_layout(
     )
 
 
-def compute_max_guard(
-    stripe_height: int,
-    *,
-    bsize: int,
-    pack_k: int,
-    border: int,
-) -> int:
-    """Return the largest guard value that keeps ``pack_k`` stripes within ``bsize``.
-
-    Parameters
-    ----------
-    stripe_height : int
-        Height of each data stripe (in pixels) before padding.
-    bsize : int
-        Size of the square tile used for packing (``H == W``).
-    pack_k : int
-        Requested number of stripes to pack together.
-    border : int
-        Pixels of padding applied above and below each stripe.
-
-    Returns
-    -------
-    int
-        Maximum guard (non-negative). Returns ``0`` when packing is not feasible
-        for the provided parameters.
-    """
-
-    pk = int(pack_k)
-    if pk <= 1:
-        return 0
-
-    stripe_h = int(stripe_height)
-    border_px = max(0, int(border))
-    slot_height = stripe_h + 2 * border_px
-    if slot_height <= 0:
-        return 0
-
-    remaining = int(bsize) - pk * slot_height
-    guard = remaining // (pk - 1) if pk > 1 else 0
-    return max(0, guard)
-
-
-def pack_planes_to_stripes(x: np.ndarray, layout: StripeLayout) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
+def pack_planes_to_stripes(
+    x: np.ndarray, layout: StripeLayout
+) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
     if x.ndim != 4:
         raise ValueError(f"Expected x shape [Lz, Ly, Lx, C], got {x.shape}")
     Lz, Ly, Lx, C = x.shape
     if Ly != layout.stripe_height:
-        raise ValueError(f"Ly mismatch: x has Ly={Ly}, layout.stripe_height={layout.stripe_height}")
+        raise ValueError(
+            f"Ly mismatch: x has Ly={Ly}, layout.stripe_height={layout.stripe_height}"
+        )
     K = layout.K
     G = (Lz + K - 1) // K
     packed = np.zeros((G, layout.bsize, Lx, C), dtype=x.dtype)
@@ -118,9 +105,13 @@ def pack_planes_to_stripes(x: np.ndarray, layout: StripeLayout) -> tuple[np.ndar
     return packed, mapping
 
 
-def unpack_stripes_to_planes(y_packed: np.ndarray, mapping: Sequence[tuple[int, int, int]], Lz: int, Ly: int) -> np.ndarray:
+def unpack_stripes_to_planes(
+    y_packed: np.ndarray, mapping: Sequence[tuple[int, int, int]], Lz: int, Ly: int
+) -> np.ndarray:
     if y_packed.ndim != 4:
-        raise ValueError(f"Expected y_packed shape [G, bsize, Lx, Cout], got {y_packed.shape}")
+        raise ValueError(
+            f"Expected y_packed shape [G, bsize, Lx, Cout], got {y_packed.shape}"
+        )
     G, bsize, Lx, Cout = y_packed.shape
     y = np.zeros((Lz, Ly, Lx, Cout), dtype=y_packed.dtype)
     for z in range(Lz):
@@ -187,8 +178,6 @@ def forward_packed_2d(
     batch_size: int = 4,
     augment: bool = False,
     tile_overlap: float = 0.1,
-    pack_k: int = 3,
-    guard: int = 16,
     pack_border: int = 0,
     return_stats: bool = False,
 ):
@@ -198,8 +187,6 @@ def forward_packed_2d(
     layout = compute_stripe_layout(
         Ly,
         bsize=bsize,
-        pack_k=pack_k,
-        guard=guard,
         border=pack_border,
     )
     if layout is None:

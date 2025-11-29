@@ -10,7 +10,6 @@ from cellpose.core import run_net
 from cellpose.unet import CellposeUNetModel
 
 from .pack_utils import (
-    compute_max_guard,
     compute_stripe_layout,
     pack_planes_to_stripes,
     unpack_stripes_to_planes,
@@ -27,8 +26,6 @@ def _run_3d_with_packing(
     augment: bool,
     tile_overlap: float,
     bsize: int,
-    pack_k: int,
-    guard: int,
     pack_border: int,
     plane_weights: np.ndarray | None,
 ):
@@ -45,7 +42,9 @@ def _run_3d_with_packing(
     else:
         weights = np.asarray(plane_weights, dtype=np.float32)
         if weights.shape != (3,):
-            raise ValueError("plane_weights must contain three elements for (XY, YZ, ZX).")
+            raise ValueError(
+                "plane_weights must contain three elements for (XY, YZ, ZX)."
+            )
         if np.any(weights < 0):
             raise ValueError("plane_weights entries must be non-negative.")
         if np.all(weights == 0):
@@ -60,28 +59,22 @@ def _run_3d_with_packing(
 
         # Only pack orthogonal planes; keep XY (YX orientation) on the baseline path
         use_pack = sstr[p] != "YX"
-        guard_eff = int(guard)
         layout = None
-        if use_pack and pack_k >= 2:
-            guard_eff = compute_max_guard(Lyp, bsize=bsize, pack_k=pack_k, border=pack_border)
+        if use_pack:
             layout = compute_stripe_layout(
                 Lyp,
                 bsize=bsize,
-                pack_k=pack_k,
-                guard=guard_eff,
                 border=pack_border,
             )
         if use_pack and layout is not None:
             logger.info(
-                "PackedCellposeModel packing orientation=%s Lz=%d Ly=%d Lx=%d pack_k=%d layout_K=%d guard=%d->%d border=%d bsize=%d slot=%d",
+                "PackedCellposeModel packing orientation=%s Lz=%d Ly=%d Lx=%d K=%d guard=%d border=%d bsize=%d slot=%d",
                 sstr[p],
                 Lzp,
                 Lyp,
                 Lxp,
-                pack_k,
                 layout.K,
-                guard,
-                guard_eff,
+                layout.guard,
                 pack_border,
                 bsize,
                 layout.slot_height,
@@ -128,8 +121,6 @@ class Packed3DMixin:
     """Shared helpers for Cellpose models that support 3D packing."""
 
     _pack_enabled: bool
-    _pack_k: int
-    _pack_guard: int
     _pack_border: int
 
     def _should_use_packing(self, do_3D: bool, anisotropy: float | int | None) -> bool:
@@ -165,8 +156,6 @@ class Packed3DMixin:
             augment=augment,
             tile_overlap=tile_overlap,
             bsize=bsize,
-            pack_k=getattr(self, "_pack_k", 3),
-            guard=getattr(self, "_pack_guard", 16),
             pack_border=getattr(self, "_pack_border", 5),
             plane_weights=plane_weights,
         )
@@ -182,17 +171,11 @@ class PackedCellposeModel(Packed3DMixin, models.CellposeModel):
         self,
         *args,
         pack_z_stripes: bool = True,
-        pack_k: int = 3,
-        pack_guard: int = 16,
-        pack_min_Ly: int = 1,
         pack_border: int = 5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._pack_enabled = bool(pack_z_stripes)
-        self._pack_k = int(pack_k)
-        self._pack_guard = int(pack_guard)
-        self._pack_min_Ly = int(pack_min_Ly)
         self._pack_border = int(pack_border)
 
     def _run_net(
@@ -230,25 +213,16 @@ class PackedCellposeModel(Packed3DMixin, models.CellposeModel):
         )
 
 
-
-
-
 class PackedCellposeModelTRT(Packed3DMixin, _CellposeModelTRT):
     def __init__(
         self,
         *args,
         pack_z_stripes: bool = True,
-        pack_k: int = 3,
-        pack_guard: int = 16,
-        pack_min_Ly: int = 1,
         pack_border: int = 5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._pack_enabled = bool(pack_z_stripes)
-        self._pack_k = int(pack_k)
-        self._pack_guard = int(pack_guard)
-        self._pack_min_Ly = int(pack_min_Ly)
         self._pack_border = int(pack_border)
 
     def _run_net(
@@ -293,17 +267,11 @@ class PackedCellposeUNetModel(Packed3DMixin, CellposeUNetModel):
         self,
         *args,
         pack_z_stripes: bool = True,
-        pack_k: int = 3,
-        pack_guard: int = 16,
-        pack_min_Ly: int = 1,
         pack_border: int = 5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._pack_enabled = bool(pack_z_stripes)
-        self._pack_k = int(pack_k)
-        self._pack_guard = int(pack_guard)
-        self._pack_min_Ly = int(pack_min_Ly)
         self._pack_border = int(pack_border)
 
     def _run_net(
@@ -353,20 +321,15 @@ class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
         pretrained_model: str,
         device=None,
         pack_z_stripes: bool = True,
-        pack_k: int = 3,
-        pack_guard: int = 16,
-        pack_min_Ly: int = 1,
         pack_border: int = 5,
         **kwargs,
     ):
         super().__init__(*args, device=device, **kwargs)
         from cellpose.contrib.cellposetrt import TRTEngineModule
+
         dev = device if device is not None else self.device
         self.net = TRTEngineModule(pretrained_model, device=dev)
         self._pack_enabled = bool(pack_z_stripes)
-        self._pack_k = int(pack_k)
-        self._pack_guard = int(pack_guard)
-        self._pack_min_Ly = int(pack_min_Ly)
         self._pack_border = int(pack_border)
 
     def _run_net(
@@ -380,6 +343,7 @@ class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
         bsize=224,
         anisotropy=1.0,
         do_3D=False,
+        plane_weights=None,
     ):
         if self._should_use_packing(do_3D, anisotropy):
             return self._run_packed_3d(
@@ -390,7 +354,7 @@ class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
                 tile_overlap=tile_overlap,
                 bsize=bsize,
                 anisotropy=anisotropy,
-                plane_weights=None,
+                plane_weights=plane_weights,
             )
         return super()._run_net(
             x,
@@ -402,6 +366,7 @@ class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
             bsize=bsize,
             anisotropy=anisotropy,
             do_3D=do_3D,
+            plane_weights=plane_weights,
         )
 
 
@@ -414,20 +379,15 @@ class CellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
         pretrained_model: str,
         device=None,
         pack_z_stripes: bool = True,
-        pack_k: int = 3,
-        pack_guard: int = 16,
-        pack_min_Ly: int = 1,
         pack_border: int = 5,
         **kwargs,
     ):
         super().__init__(*args, device=device, **kwargs)
         from cellpose.contrib.cellposetrt import TRTEngineModule
+
         dev = device if device is not None else self.device
         self.net = TRTEngineModule(pretrained_model, device=dev)
         self._pack_enabled = bool(pack_z_stripes)
-        self._pack_k = int(pack_k)
-        self._pack_guard = int(pack_guard)
-        self._pack_min_Ly = int(pack_min_Ly)
         self._pack_border = int(pack_border)
 
     def _run_net(
