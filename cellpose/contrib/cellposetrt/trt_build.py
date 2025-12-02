@@ -97,7 +97,7 @@ def export_onnx(pretrained_model: str, onnx_out: str, *, batch_size: int, bsize:
             dummy,
             onnx_out,
             opset_version=opset,
-            dynamo=False,
+            dynamo=True,
             input_names=["input"],
             output_names=["y", "style"],
             dynamic_axes={
@@ -172,7 +172,7 @@ def main():
     ap.add_argument("--vram", type=int, default=12000, help="Amount of GPU memory available (in MB) for TensorRT to optimize for")
     ap.add_argument("--batch-size", type=int, default=1, help="Max batch dimension N (engine supports dynamic [1..N])")
     ap.add_argument("--bsize", type=int, default=256, help="Tile size (256x256 by default)")
-    ap.add_argument("--opset", type=int, default=20, help="ONNX opset version to use for export")
+    ap.add_argument("--opset", type=int, default=22, help="ONNX opset version to use for export")
     ap.add_argument("--backend", choices=("sam", "unet"), default="sam", help="Segmentation backbone to export")
     args = ap.parse_args()
 
