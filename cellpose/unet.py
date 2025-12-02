@@ -148,6 +148,21 @@ def run_net(net: CPnet, imgi: np.ndarray, batch_size: int = 8, augment: bool = F
     ntiles = ny * nx
     nimgs = max(1, batch_size // ntiles)
     niter = int(np.ceil(Lz / nimgs))
+    models_logger.info(
+        "tiling decision: Lz=%d, Ly=%d, Lx=%d, bsize=%d, augment=%s, tile_overlap=%.3f -> "
+        "ny=%d, nx=%d, ntiles=%d, nimgs_per_batch=%d, niter=%d",
+        Lz,
+        Ly,
+        Lx,
+        bsize,
+        augment,
+        tile_overlap,
+        ny,
+        nx,
+        ntiles,
+        nimgs,
+        niter,
+    )
     ziterator = (trange(niter, file=utils.TqdmToLogger(models_logger, level=logging.INFO), mininterval=30)
                  if niter > 10 or Lz > 1 else range(niter))
 
@@ -565,7 +580,8 @@ class CellposeUNetModel:
     def _run_net(self, x, rescale=1.0, resample=True, augment=False,
                  batch_size=8, tile_overlap=0.1,
                  bsize=224, anisotropy=1.0, do_3D=False,
-                 plane_weights: Optional[Sequence[float]] = None):
+                 plane_weights: Optional[Sequence[float]] = None,
+                 return_raw_3d: bool = False, **kwargs):
         tic = time.time()
         shape = x.shape
         nimg = shape[0]
@@ -595,6 +611,19 @@ class CellposeUNetModel:
                     Ly=int(Lz_r * anisotropy),
                     Lx=int(Lx_r),
                 ).transpose(1, 0, 2, 3)
+
+            if return_raw_3d:
+                return run_3D_core(
+                    self.net,
+                    x,
+                    batch_size=batch_size,
+                    augment=augment,
+                    tile_overlap=tile_overlap,
+                    bsize=bsize,
+                    net_ortho=self.net_ortho,
+                    plane_weights=plane_weights,
+                    return_raw=True,
+                )
 
             # Mirror SAM behavior: use core.run_3D with optional ortho net and plane weights (None -> uniform)
             yf, styles = run_3D_core(

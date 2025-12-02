@@ -2,11 +2,12 @@
 Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer , Michael Rariden and Marius Pachitariu.
 """
 import logging
-import numpy as np
-from tqdm import trange
-from . import transforms, utils
 
+import numpy as np
 import torch
+from tqdm import trange
+
+from . import transforms, utils
 
 TORCH_ENABLED = True
 
@@ -15,7 +16,7 @@ tqdm_out = utils.TqdmToLogger(core_logger, level=logging.INFO)
 
 
 def use_gpu(gpu_number=0, use_torch=True):
-    """ 
+    """
     Check if GPU is available for use.
 
     Args:
@@ -101,7 +102,7 @@ def assign_device(use_torch=True, gpu=False, device=0):
         core_logger.info('>>>> using CPU')
         gpu = False
         cpu = True
-    
+
     if cpu:
         device = torch.device("cpu")
         core_logger.info(">>>> using CPU")
@@ -174,9 +175,8 @@ def _forward(net, x):
 
 def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             rsz=None, single_tile_if_fit=False):
-    """ 
+    """
     Run network on stack of images.
-    
     (faster if augment is False)
 
     Args:
@@ -190,18 +190,18 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
 
     Returns:
         Tuple[numpy.ndarray, numpy.ndarray]: outputs of network y and style. If tiled `y` is averaged in tile overlaps. Size of [Ly x Lx x 3] or [Lz x Ly x Lx x 3].
-            y[...,0] is Y flow; y[...,1] is X flow; y[...,2] is cell probability. 
+            y[...,0] is Y flow; y[...,1] is X flow; y[...,2] is cell probability.
             style is a 1D array of size 256 summarizing the style of the image, if tiled `style` is averaged over tiles.
     """
     # run network
-    Lz, Ly0, Lx0, nchan = imgi.shape 
+    Lz, Ly0, Lx0, nchan = imgi.shape
     if rsz is not None:
         if not isinstance(rsz, list) and not isinstance(rsz, np.ndarray):
             rsz = [rsz, rsz]
         Lyr, Lxr = int(Ly0 * rsz[0]), int(Lx0 * rsz[1])
     else:
         Lyr, Lxr = Ly0, Lx0
-    
+
     ly, lx = bsize, bsize
     # default padding matches legacy behavior (ensures >= bsize and multiples of 16 with extra margins)
     ypad1, ypad2, xpad1, xpad2 = transforms.get_pad_yx(Lyr, Lxr, min_size=(bsize, bsize))
@@ -221,20 +221,35 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         # X dimension: keep legacy pads to preserve tile shapes
     Ly, Lx = Lyr + ypad1 + ypad2, Lxr + xpad1 + xpad2
     pads = np.array([[0, 0], [ypad1, ypad2], [xpad1, xpad2]])
-    
+
     if augment:
         ny = max(2, int(np.ceil(2. * Ly / bsize)))
         nx = max(2, int(np.ceil(2. * Lx / bsize)))
     else:
         ny = 1 if Ly <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Ly / bsize))
         nx = 1 if Lx <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Lx / bsize))
-    
-    
+
     # run multiple slices at the same time
     ntiles = ny * nx
-    nimgs = max(1, batch_size // ntiles) # number of imgs to run in the same batch
+    nimgs = max(1, batch_size // ntiles)  # number of imgs to run in the same batch
     niter = int(np.ceil(Lz / nimgs))
-    ziterator = (trange(niter, file=tqdm_out, mininterval=30) 
+    core_logger.info(
+        "tiling decision: Lz=%d, Ly=%d, Lx=%d, bsize=%d, augment=%s, tile_overlap=%.3f, "
+        "single_tile_if_fit=%s -> ny=%d, nx=%d, ntiles=%d, nimgs_per_batch=%d, niter=%d",
+        Lz,
+        Ly,
+        Lx,
+        bsize,
+        augment,
+        tile_overlap,
+        single_tile_if_fit,
+        ny,
+        nx,
+        ntiles,
+        nimgs,
+        niter,
+    )
+    ziterator = (trange(niter, file=tqdm_out, mininterval=30)
                     if niter > 10 or Lz > 1 else range(niter))
     for k in ziterator:
         inds = np.arange(k * nimgs, min(Lz, (k + 1) * nimgs))
@@ -246,9 +261,8 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             IMG, ysub, xsub, Lyt, Lxt = transforms.make_tiles(
                 imgb, bsize=bsize, augment=augment,
                 tile_overlap=(0.0 if (single_tile_if_fit and not augment and Lx <= bsize and Ly <= bsize) else tile_overlap))
-            IMGa[i * ntiles : (i+1) * ntiles] = np.reshape(IMG, 
+            IMGa[i * ntiles : (i+1) * ntiles] = np.reshape(IMG,
                                             (ny * nx, nchan, ly, lx))
-        
         # run network
         for j in range(0, IMGa.shape[0], batch_size):
             bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
@@ -277,16 +291,17 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             # styles[b] = stylei
     # slices from padding
     yf = yf[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
-    yf = yf.transpose(0,2,3,1)   
+    yf = yf.transpose(0,2,3,1)
     return yf, np.array(styles)
 
 
 def run_3D(net, imgs, batch_size=8, augment=False,
            tile_overlap=0.1, bsize=224, net_ortho=None,
-           progress=None, plane_weights=None):
-    """ 
+           progress=None, plane_weights=None,
+           return_raw=False):
+    """
     Run network on image z-stack.
-    
+
     (faster if augment is False)
 
     Args:
@@ -299,13 +314,16 @@ def run_3D(net, imgs, batch_size=8, augment=False,
         bsize (int, optional): Size of tiles to use in pixels [bsize x bsize]. Defaults to 224.
         net_ortho (class, optional): cellpose network for orthogonal ZY and ZX planes. Defaults to None.
         progress (QProgressBar, optional): pyqt progress bar. Defaults to None.
+        return_raw (bool, optional): If True, return raw per-axis outputs before aggregation. Defaults to False.
 
     Returns:
-        Tuple[numpy.ndarray, numpy.ndarray]: outputs of network y and style. If tiled `y` is averaged in tile overlaps. Size of [Ly x Lx x 3] or [Lz x Ly x Lx x 3].
-            y[...,0] is Z flow; y[...,1] is Y flow; y[...,2] is X flow; y[...,3] is cell probability. 
-            style is a 1D array of size 256 summarizing the style of the image, if tiled `style` is averaged over tiles.
+        If `return_raw` is True:
+            dict: Raw per-axis outputs with keys "xy", "xz", "yz". Each value is a dict with:
+                - "y": np.ndarray of shape [num_slices, H, W, 3] (2D flows + cellprob)
+                - "style": np.ndarray style vector
     """
     sstr = ["YX", "ZY", "ZX"]
+    orient_keys = ["xy", "xz", "yz"]  # match user-facing plane names
     pm = [(0, 1, 2, 3), (1, 0, 2, 3), (2, 0, 1, 3)]
     ipm = [(0, 1, 2), (1, 0, 2), (1, 2, 0)]
     cp = [(1, 2), (0, 2), (0, 1)]
@@ -324,6 +342,7 @@ def run_3D(net, imgs, batch_size=8, augment=False,
             raise ValueError("At least one plane weight must be positive.")
     flow_weight_totals = np.zeros(3, dtype=np.float32)
     cellprob_weight_total = 0.0
+    raw_outputs = {} if return_raw else None
     for p in range(3):
         weight = float(weights[p])
         xsl = imgs.transpose(pm[p])
@@ -335,6 +354,9 @@ def run_3D(net, imgs, batch_size=8, augment=False,
                            xsl, batch_size=batch_size, augment=augment,
                            bsize=bsize, tile_overlap=tile_overlap,
                            rsz=None)
+        if return_raw:
+            raw_outputs[orient_keys[p]] = {"y": y.copy(), "style": style.copy()}
+
         yf[..., -1] += weight * y[..., -1].transpose(ipm[p])
         cellprob_weight_total += weight
         for j in range(2):
@@ -345,6 +367,10 @@ def run_3D(net, imgs, batch_size=8, augment=False,
 
         if progress is not None:
             progress.setValue(25 + 15 * p)
+
+    if return_raw:
+        return raw_outputs
+
     for axis_idx in range(3):
         if flow_weight_totals[axis_idx] > 0:
             yf[..., axis_idx] /= flow_weight_totals[axis_idx]

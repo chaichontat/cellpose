@@ -11,11 +11,8 @@ import torch
 from torch import nn
 from tqdm import trange
 
-from cellpose import dynamics, io, models, utils, metrics
-from cellpose.contrib.pack_utils import (
-    compute_stripe_layout,
-    pack_planes_to_stripes,
-)
+from cellpose import dynamics, io, metrics, models, utils
+from cellpose.contrib.pack_utils import compute_stripe_layout, pack_planes_to_stripes
 from cellpose.transforms import convert_image, normalize_img, random_rotate_and_resize
 
 from .schedules import build_lr_schedule
@@ -906,7 +903,12 @@ def _process_train_test(
     train_probs = (
         1.0 / nimg * np.ones(nimg, "float64") if train_probs is None else train_probs
     )
-    train_probs /= train_probs.sum()
+
+    total = float(train_probs.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        train_probs = np.ones(nimg, dtype=np.float64) / max(float(nimg), 1.0)
+    else:
+        train_probs = train_probs / total
     if test_files is not None or test_data is not None:
         test_probs = (
             1.0 / nimg_test * np.ones(nimg_test, "float64")
@@ -1085,6 +1087,10 @@ def train_seg(
     # Pack setup deferred until after _process_train_test() so we have diam_train
     pack_border_effective: int = max(0, int(pack_stripe_border))
 
+    # Remember whether the caller provided custom sampling probabilities.
+    # When train_probs is None, we will default to area-based sampling below.
+    _use_area_sampling = train_probs is None
+
     out = _process_train_test(
         train_data=train_data,
         train_labels=train_labels,
@@ -1219,6 +1225,32 @@ def train_seg(
         nimg_test if nimg_test_per_epoch is None else nimg_test_per_epoch
     )
 
+    # Area-proportional sampling: if no explicit train_probs are provided and
+    # training images are in memory, set per-image inclusion probabilities
+    # proportional to image area (H×W). The largest image has probability 1.0,
+    # an image with half the area has probability 0.5.
+    size_probs: np.ndarray | None = None
+    if train_data is not None and _use_area_sampling:
+        areas = np.array(
+            [
+                float(train_data[i].shape[-2] * train_data[i].shape[-1])
+                for i in range(nimg)
+            ],
+            dtype="float64",
+        )
+        max_area = float(areas.max(initial=0.0))
+        if max_area > 0.0 and np.isfinite(max_area):
+            size_probs = areas / max_area
+            train_logger.info(
+                ">>> Area-based sampling enabled: %d images, prob range [%.3f, 1.0], "
+                "expected %.1f images/epoch",
+                nimg,
+                float(size_probs.min(initial=1.0)),
+                float(size_probs.sum()),
+            )
+    else:
+        train_logger.info("Using provided train_probs for sampling")
+
     # learning rate schedule
     LR = build_lr_schedule(
         n_epochs,
@@ -1296,19 +1328,30 @@ def train_seg(
         std_tiles_epoch = 0
         total_train_tiles = 0
         np.random.seed(iepoch)
-        if nimg != nimg_per_epoch:
+        if size_probs is not None:
+            # Probabilistic inclusion: each image sampled independently with
+            # probability proportional to its area.
+            included = np.random.rand(nimg) < size_probs
+            if not included.any():
+                # Ensure at least one image (one of the largest) is included.
+                included[np.argmax(size_probs)] = True
+            rperm = np.random.permutation(np.where(included)[0])
+            nimg_this_epoch = len(rperm)
+        elif nimg != nimg_per_epoch:
             # choose random images for epoch with probability train_probs
             rperm = np.random.choice(
                 np.arange(0, nimg), size=(nimg_per_epoch,), p=train_probs
             )
+            nimg_this_epoch = nimg_per_epoch
         else:
             # otherwise use all images
             rperm = np.random.permutation(np.arange(0, nimg))
+            nimg_this_epoch = nimg
         for param_group in optimizer.param_groups:
             param_group["lr"] = LR[iepoch]  # set learning rate
         net.train()
-        for k in range(0, nimg_per_epoch, batch_size):
-            kend = min(k + batch_size, nimg_per_epoch)
+        for k in range(0, nimg_this_epoch, batch_size):
+            kend = min(k + batch_size, nimg_this_epoch)
             inds = rperm[k:kend]
             imgs, lbls = _get_batch(
                 inds,

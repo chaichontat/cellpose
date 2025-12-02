@@ -202,6 +202,7 @@ def _train_cellposemodel_cli(args, logger, image_filter, device, pretrained_mode
             warmup_epochs=args.warmup_epochs,
             cosine_hold_epochs=args.cosine_hold_epochs,
             cosine_min_lr=args.cosine_min_lr,
+            iou_every=args.eval_iou_every,
             )[0]
     model.pretrained_model = cpmodel_path
     logger.info(">>>> model trained and saved to %s" % cpmodel_path)

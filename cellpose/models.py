@@ -196,7 +196,8 @@ class CellposeModel():
              flow3D_smooth=0, ortho_weights=None, stitch_threshold=0.0,
              min_size=15, max_size_fraction=0.4, niter=None,
              augment=False, tile_overlap=0.1, bsize=256,
-             compute_masks=True, progress=None):
+             compute_masks=True, progress=None,
+             return_raw_3d=False):
         """ segment list of images x, or 4D array - Z x 3 x Y x X
 
         Args:
@@ -348,7 +349,8 @@ class CellposeModel():
         if isinstance(anisotropy, (float, int)) and image_scaling:
             anisotropy = image_scaling * anisotropy
 
-        dP, cellprob, styles = self._run_net(
+
+        run_net_outputs = self._run_net(
             x,
             augment=augment,
             batch_size=batch_size,
@@ -356,7 +358,14 @@ class CellposeModel():
             bsize=bsize,
             do_3D=do_3D,
             anisotropy=anisotropy,
-            plane_weights=ortho_weights)
+            plane_weights=ortho_weights,
+            return_raw_3d=return_raw_3d and do_3D)
+
+        if return_raw_3d and do_3D:
+            return run_net_outputs
+
+        dP, cellprob, styles = run_net_outputs
+
 
         if do_3D:
             if flow3D_smooth > 0:
@@ -493,7 +502,8 @@ class CellposeModel():
                 augment=False,
                 batch_size=8, tile_overlap=0.1,
                 bsize=256, anisotropy=1.0, do_3D=False,
-                plane_weights=None):
+                plane_weights=None,
+                return_raw_3d=False):
         """ run network on image x """
         tic = time.time()
         shape = x.shape
@@ -507,6 +517,20 @@ class CellposeModel():
                 x = transforms.resize_image(x.transpose(1,0,2,3),
                                         Ly=int(Lz*anisotropy),
                                         Lx=int(Lx)).transpose(1,0,2,3)
+            if return_raw_3d:
+                raw_outputs = run_3D(
+                    self.net,
+                    x,
+                    batch_size=batch_size,
+                    augment=augment,
+                    tile_overlap=tile_overlap,
+                    bsize=bsize,
+                    net_ortho=self.net_ortho,
+                    plane_weights=plane_weights,
+                    return_raw=True,
+                )
+                return raw_outputs
+
             yf, styles = run_3D(
                 self.net,
                 x,

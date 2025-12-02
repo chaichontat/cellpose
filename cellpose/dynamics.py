@@ -18,6 +18,35 @@ from . import utils
 import torch
 import torch.nn.functional as F
 
+# -----------------------------------------------------------------------------
+# get_masks_torch hyperparameters
+# -----------------------------------------------------------------------------
+# These constants control the histogram-based clustering of final flow endpoints
+# into instance masks. They are kept as module-level variables for easier
+# inspection and potential tuning; default values match the original behavior.
+
+# Padding applied to the endpoint coordinates when building the histogram.
+GET_MASKS_RPAD: int = 20
+
+# Neighborhood size for peak detection in the endpoint histogram (max pooling).
+GET_MASKS_PEAK_KERNEL_SIZE: int = 6
+
+# Minimum number of endpoints at a voxel to consider it a valid peak.
+GET_MASKS_MIN_PEAK_COUNT: int = 12
+
+# Half-width (in voxels) of the local window used around each peak during
+# seed growth. The full window size is (2 * radius + 1) in each dimension.
+GET_MASKS_SEED_WINDOW_RADIUS: int = 5
+
+# Number of seed growth iterations within the local window.
+GET_MASKS_SEED_GROW_ITERS: int = 5
+
+# Kernel size for the max-pooling operation during seed growth.
+GET_MASKS_SEED_GROW_KERNEL_SIZE: int = 3
+
+# Minimum local histogram value required to include a voxel in a grown seed.
+GET_MASKS_SEED_DENSITY_THRESHOLD: int = 2
+
 def _extend_centers_gpu(neighbors, meds, isneighbor, shape, n_iter=200,
                         device=torch.device("cpu")):
     """Runs diffusion on GPU to generate flows for training images or quality control.
@@ -501,9 +530,22 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
             size [axis x Ly x Lx] or [axis x Lz x Ly x Lx].
         iscell (bool, 2D or 3D array): If iscell is not None, set pixels that are
             iscell False to stay in their original location.
-        rpad (int, optional): Histogram edge padding. Default is 20.
+        rpad (int, optional): Histogram edge padding. Default is 20 (or GET_MASKS_RPAD).
         max_size_fraction (float, optional): Masks larger than max_size_fraction of
             total image size are removed. Default is 0.4.
+
+    Clustering hyperparameters (module-level; defaults in parentheses):
+        GET_MASKS_PEAK_KERNEL_SIZE (5): neighborhood size for initial peak detection
+            in the endpoint histogram.
+        GET_MASKS_MIN_PEAK_COUNT (10): minimum endpoint count at a voxel to be
+            considered a valid peak.
+        GET_MASKS_SEED_WINDOW_RADIUS (5): half-width of local window used for seed
+            growth; full window size is 2 * radius + 1.
+        GET_MASKS_SEED_GROW_ITERS (5): number of seed growth iterations.
+        GET_MASKS_SEED_GROW_KERNEL_SIZE (3): kernel size for max-pooling during
+            seed growth.
+        GET_MASKS_SEED_DENSITY_THRESHOLD (2): minimum local histogram value
+            required to include a voxel in a grown seed.
 
     Returns:
         M0 (int, 2D or 3D array): Masks with inconsistent flow masks removed,
@@ -513,7 +555,10 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
     ndim = len(shape0)
     device = pt.device
 
-    rpad = 20
+    # Use module-level default if caller passes the original default.
+    if rpad == 20:
+        rpad = GET_MASKS_RPAD
+
     pt += rpad
     pt = torch.clamp(pt, min=0)
     for i in range(len(pt)):
@@ -524,14 +569,17 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
     shape = tuple(np.array(shape0) + 2*rpad)
 
     # sparse coo torch
-    coo = torch.sparse_coo_tensor(pt, torch.ones(pt.shape[1], device=pt.device, dtype=torch.int),
-                                shape)
+    coo = torch.sparse_coo_tensor(
+        pt, torch.ones(pt.shape[1], device=pt.device, dtype=torch.int), shape
+    )
     h1 = coo.to_dense()
     del coo
 
-    hmax1 = max_pool_nd(h1.unsqueeze(0), kernel_size=5)
+    hmax1 = max_pool_nd(h1.unsqueeze(0), kernel_size=GET_MASKS_PEAK_KERNEL_SIZE)
     hmax1 = hmax1.squeeze()
-    seeds1 = torch.nonzero((h1 - hmax1 > -1e-6) * (h1 > 10))
+    seeds1 = torch.nonzero(
+        (h1 - hmax1 > -1e-6) * (h1 > GET_MASKS_MIN_PEAK_COUNT)
+    )
     del hmax1
     if len(seeds1) == 0:
         dynamics_logger.warning("no seeds found in get_masks_torch - no masks found.")
@@ -542,23 +590,33 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
     seeds1 = seeds1[isort1]
 
     n_seeds = len(seeds1)
-    h_slc = torch.zeros((n_seeds, *[11]*ndim), device=seeds1.device)
+    window_radius = GET_MASKS_SEED_WINDOW_RADIUS
+    window_diameter = 2 * window_radius + 1
+    h_slc = torch.zeros((n_seeds, *[window_diameter]*ndim), device=seeds1.device)
     for k in range(n_seeds):
-        slc = tuple([slice(seeds1[k][j]-5, seeds1[k][j]+6) for j in range(ndim)])
+        slc = tuple(
+            slice(seeds1[k][j] - window_radius, seeds1[k][j] + window_radius + 1)
+            for j in range(ndim)
+        )
         h_slc[k] = h1[slc]
     del h1
-    seed_masks = torch.zeros((n_seeds, *[11]*ndim), device=seeds1.device)
+    seed_masks = torch.zeros((n_seeds, *[window_diameter]*ndim), device=seeds1.device)
     if ndim==2:
-        seed_masks[:,5,5] = 1
+        seed_masks[:, window_radius, window_radius] = 1
     else:
-        seed_masks[:,5,5,5] = 1
+        seed_masks[:, window_radius, window_radius, window_radius] = 1
 
-    for iter in range(5):
+    for iter in range(GET_MASKS_SEED_GROW_ITERS):
         # extend
-        seed_masks = max_pool_nd(seed_masks, kernel_size=3)
-        seed_masks *= h_slc > 2
+        seed_masks = max_pool_nd(
+            seed_masks, kernel_size=GET_MASKS_SEED_GROW_KERNEL_SIZE
+        )
+        seed_masks *= h_slc > GET_MASKS_SEED_DENSITY_THRESHOLD
     del h_slc
-    seeds_new = [tuple((torch.nonzero(seed_masks[k]) + seeds1[k] - 5).T)
+    seeds_new = [
+        tuple(
+            (torch.nonzero(seed_masks[k]) + seeds1[k] - window_radius).T
+        )
             for k in range(n_seeds)]
     del seed_masks
 

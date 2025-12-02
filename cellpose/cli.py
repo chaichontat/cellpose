@@ -233,6 +233,12 @@ def get_arg_parser():
                                help="weight decay. Default: %(default)s")
     training_args.add_argument("--n_epochs", default=100, type=int,
                                help="number of epochs. Default: %(default)s")
+    training_args.add_argument(
+        "--eval_iou_every",
+        default=10,
+        type=int,
+        help="compute AJI (IoU-like) on test split every N epochs; set to 0/None to disable (default: 10)",
+    )
     training_args.add_argument("--train_batch_size", default=1, type=int,
                                help="training batch size. Default: %(default)s")
     training_args.add_argument("--bsize", default=256, type=int,

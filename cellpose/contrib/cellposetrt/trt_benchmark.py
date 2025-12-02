@@ -52,7 +52,8 @@ import tifffile
 import torch
 
 from cellpose import models
-from cellpose.contrib.cellposetrt import CellposeModelTRT
+from cellpose.contrib.cellposetrt import CellposeModelTRT, TRTEngineModule
+from cellpose.unet import CellposeUNetModel
 
 TILE_SLICE = np.s_[5, :, :512, :512]
 
@@ -89,6 +90,12 @@ def parse_args():
         type=Path,
         default=None,
         help="Optional output path (directory or .tif file) to save stacked masks from the IoU parity test",
+    )
+    ap.add_argument(
+        "--backend",
+        choices=("sam", "unet"),
+        default="sam",
+        help="Segmentation backend to benchmark",
     )
     return ap.parse_args()
 
@@ -184,13 +191,34 @@ print(f"Engine path: {args.engine}")
 device = torch.device("cuda:0")
 print(f"Using CUDA device: {device} | {torch.cuda.get_device_name(device)}")
 
-base = models.CellposeModel(gpu=True, device=device, pretrained_model=args.pretrained)
-trt_model = CellposeModelTRT(
-    gpu=True,
-    device=device,
-    pretrained_model=args.pretrained,
-    engine_path=str(args.engine),
-)
+if args.backend == "sam":
+    base = models.CellposeModel(gpu=True, device=device, pretrained_model=args.pretrained)
+    trt_model = CellposeModelTRT(
+        gpu=True,
+        device=device,
+        pretrained_model=args.pretrained,
+        engine_path=str(args.engine),
+    )
+    engine_module = trt_model.net
+else:
+    base = CellposeUNetModel(gpu=True, device=device, pretrained_model=args.pretrained)
+    trt_model = CellposeUNetModel(gpu=True, device=device, pretrained_model=args.pretrained)
+    engine_module = TRTEngineModule(str(args.engine), device=device)
+    trt_model.net = engine_module
+
+engine_bsize = engine_module._in_dims[2]
+if engine_bsize <= 0:
+    raise ValueError("Engine must have fixed spatial dimension; rebuild with explicit --bsize.")
+eval_kwargs["bsize"] = engine_bsize
+
+nchan_in = getattr(base, "nchan", 3 if args.backend == "sam" else 2)
+
+if engine_module._fixedN is not None:
+    if engine_module._fixedN != args.batch_size:
+        print(
+            f"[WARN] Engine fixed batch N={engine_module._fixedN} overrides requested batch size {args.batch_size}."
+        )
+    eval_kwargs["batch_size"] = engine_module._fixedN
 
 with torch.inference_mode():
     base_out = base.eval(tile, **eval_kwargs)
@@ -198,8 +226,9 @@ with torch.inference_mode():
 
 print("\n[TEST] Full pipeline parity")
 masks_pt, masks_trt = base_out[0], trt_out[0]
+mask_iou = iou_binary(masks_pt != 0, masks_trt != 0)
 print(
-    f"  masks: torch={masks_pt.shape} trt={masks_trt.shape}  IoU={iou_binary(masks_pt != 0, masks_trt != 0):.4f}"
+    f"  masks: torch={masks_pt.shape} trt={masks_trt.shape}  IoU={mask_iou:.4f}"
 )
 
 flows_pt = base_out[1]
@@ -211,20 +240,31 @@ for k, (fpt, ftrt) in enumerate(zip(flows_pt, flows_trt)):
 with torch.inference_mode():
     print("\n[TIMING] Full pipeline eval(tile3)")
     ms_base = time_op("  Torch eval", lambda: base.eval(tile, **eval_kwargs))
-    ms_trt = time_op(
-        "  TRT eval",
-        lambda: models.CellposeModel.eval(trt_model, tile, **eval_kwargs),
-    )
+    ms_trt = time_op("  TRT eval", lambda: trt_model.eval(tile, **eval_kwargs))
 
 spd = ms_base / ms_trt
 print(f"  Speedup vs Torch: x{spd:.2f}")
 
-# Net-only timing on representative Nx3x256x256 batch (CUDA events)
+# Net-only timing on representative tensor (CUDA events)
 with torch.inference_mode():
-    print(f"\n[TIMING] Net-only forward ({args.batch_size}x3x256x256)")
-    Xb = torch.randn(args.batch_size, 3, 256, 256, device=device, dtype=torch.bfloat16)
-    ms_torch_net = time_op_cuda("  Torch net", lambda: base.net(Xb))
-    ms_trt_net = time_op_cuda("  TRT net  ", lambda: trt_model.net(Xb))
+    bench_batch = engine_module._fixedN or args.batch_size
+    params = list(base.net.parameters())
+    torch_dtype = params[0].dtype if params else torch.float32
+    print(
+        f"\n[TIMING] Net-only forward ({bench_batch}x{nchan_in}x{engine_bsize}x{engine_bsize})"
+    )
+    Xb_torch = torch.randn(
+        bench_batch,
+        nchan_in,
+        engine_bsize,
+        engine_bsize,
+        device=device,
+        dtype=torch_dtype,
+    )
+    Xb_trt = Xb_torch.to(engine_module._dtype_in)
+
+    ms_torch_net = time_op_cuda("  Torch net", lambda: base.net(Xb_torch))
+    ms_trt_net = time_op_cuda("  TRT net  ", lambda: engine_module(Xb_trt))
     if ms_trt_net > 0:
         print(f"  Speedup (net-only): x{ms_torch_net / ms_trt_net:.2f}")
 

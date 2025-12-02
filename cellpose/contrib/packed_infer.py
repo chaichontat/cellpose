@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-
 from cellpose import models, transforms
 from cellpose.contrib.cellposetrt import CellposeModelTRT as _CellposeModelTRT
 from cellpose.core import run_net
+from cellpose.train import _PACK_STRIPE_BORDER
 from cellpose.unet import CellposeUNetModel
 
 from .pack_utils import (
@@ -28,8 +28,11 @@ def _run_3d_with_packing(
     bsize: int,
     pack_border: int,
     plane_weights: np.ndarray | None,
+    return_raw_3d: bool = False,
+    **kwargs
 ):
     sstr = ["YX", "ZY", "ZX"]
+    orient_keys = ["xy", "xz", "yz"]  # align with core.run_3D return_raw contract
     pm = [(0, 1, 2, 3), (1, 0, 2, 3), (2, 0, 1, 3)]
     ipm = [(0, 1, 2), (1, 0, 2), (1, 2, 0)]
     cp = [(1, 2), (0, 2), (0, 1)]
@@ -51,6 +54,7 @@ def _run_3d_with_packing(
             raise ValueError("At least one plane weight must be positive.")
     flow_weight_totals = np.zeros(3, dtype=np.float32)
     cellprob_weight_total = 0.0
+    raw_outputs = {}
 
     for p in range(3):
         weight = float(weights[p])
@@ -100,6 +104,10 @@ def _run_3d_with_packing(
                 bsize=bsize,
             )
 
+        if return_raw_3d:
+            raw_outputs[orient_keys[p]] = {"y": y, "style": styles}
+            continue
+
         styles_last = styles
         yf[..., -1] += weight * y[..., -1].transpose(ipm[p])
         cellprob_weight_total += weight
@@ -107,6 +115,9 @@ def _run_3d_with_packing(
             axis_idx = cp[p][j]
             yf[..., axis_idx] += weight * y[..., cpy[p][j]].transpose(ipm[p])
             flow_weight_totals[axis_idx] += weight
+
+    if return_raw_3d:
+        return raw_outputs
 
     for axis_idx in range(3):
         if flow_weight_totals[axis_idx] > 0:
@@ -139,7 +150,8 @@ class Packed3DMixin:
         tile_overlap: float,
         bsize: int,
         anisotropy: float | int | None = 1.0,
-        plane_weights=None,
+        return_raw_3d: bool = False,
+        **kwargs
     ):
         # Mirror baseline behavior: if anisotropy is provided and != 1.0, resize Y accordingly
         if isinstance(anisotropy, (float, int)) and anisotropy not in (None, 1.0):
@@ -149,16 +161,21 @@ class Packed3DMixin:
                 Ly=int(Lz * float(anisotropy)),
                 Lx=int(Lx),
             ).transpose(1, 0, 2, 3)
-        yf, styles = _run_3d_with_packing(
+        res = _run_3d_with_packing(
             net,
             x,
             batch_size=batch_size,
             augment=augment,
             tile_overlap=tile_overlap,
             bsize=bsize,
-            pack_border=getattr(self, "_pack_border", 5),
-            plane_weights=plane_weights,
+            pack_border=getattr(self, "_pack_border", _PACK_STRIPE_BORDER),
+            return_raw_3d=return_raw_3d,
+            **kwargs
         )
+        if return_raw_3d:
+            return res
+
+        yf, styles = res
         cellprob = yf[..., -1]
         dP = yf[..., :-1].transpose((3, 0, 1, 2))
         return dP, cellprob, styles
@@ -171,7 +188,7 @@ class PackedCellposeModel(Packed3DMixin, models.CellposeModel):
         self,
         *args,
         pack_z_stripes: bool = True,
-        pack_border: int = 5,
+        pack_border: int = _PACK_STRIPE_BORDER,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -188,6 +205,8 @@ class PackedCellposeModel(Packed3DMixin, models.CellposeModel):
         anisotropy: float = 1.0,
         do_3D: bool = False,
         plane_weights=None,
+        return_raw_3d: bool = False,
+        **kwargs,
     ):
         if self._should_use_packing(do_3D, anisotropy):
             return self._run_packed_3d(
@@ -199,6 +218,8 @@ class PackedCellposeModel(Packed3DMixin, models.CellposeModel):
                 bsize=bsize,
                 anisotropy=anisotropy,
                 plane_weights=plane_weights,
+                return_raw_3d=return_raw_3d,
+                **kwargs
             )
 
         return super()._run_net(
@@ -210,6 +231,8 @@ class PackedCellposeModel(Packed3DMixin, models.CellposeModel):
             anisotropy=anisotropy,
             do_3D=do_3D,
             plane_weights=plane_weights,
+            return_raw_3d=return_raw_3d,
+            **kwargs
         )
 
 
@@ -218,7 +241,7 @@ class PackedCellposeModelTRT(Packed3DMixin, _CellposeModelTRT):
         self,
         *args,
         pack_z_stripes: bool = True,
-        pack_border: int = 5,
+        pack_border: int = _PACK_STRIPE_BORDER,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -235,6 +258,8 @@ class PackedCellposeModelTRT(Packed3DMixin, _CellposeModelTRT):
         anisotropy: float = 1.0,
         do_3D: bool = False,
         plane_weights=None,
+        return_raw_3d: bool = False,
+        **kwargs,
     ):
         if self._should_use_packing(do_3D, anisotropy):
             return self._run_packed_3d(
@@ -246,6 +271,8 @@ class PackedCellposeModelTRT(Packed3DMixin, _CellposeModelTRT):
                 bsize=bsize,
                 anisotropy=anisotropy,
                 plane_weights=plane_weights,
+                return_raw_3d=return_raw_3d,
+                **kwargs
             )
 
         return super()._run_net(
@@ -257,6 +284,8 @@ class PackedCellposeModelTRT(Packed3DMixin, _CellposeModelTRT):
             anisotropy=anisotropy,
             do_3D=do_3D,
             plane_weights=plane_weights,
+            return_raw_3d=return_raw_3d,
+            **kwargs
         )
 
 
@@ -286,6 +315,8 @@ class PackedCellposeUNetModel(Packed3DMixin, CellposeUNetModel):
         anisotropy=1.0,
         do_3D=False,
         plane_weights=None,
+        return_raw_3d=False,
+        **kwargs,
     ):
         if self._should_use_packing(do_3D, anisotropy):
             return self._run_packed_3d(
@@ -297,6 +328,7 @@ class PackedCellposeUNetModel(Packed3DMixin, CellposeUNetModel):
                 bsize=bsize,
                 anisotropy=anisotropy,
                 plane_weights=plane_weights,
+                return_raw_3d=return_raw_3d,
             )
         return super()._run_net(
             x,
@@ -309,6 +341,7 @@ class PackedCellposeUNetModel(Packed3DMixin, CellposeUNetModel):
             anisotropy=anisotropy,
             do_3D=do_3D,
             plane_weights=plane_weights,
+            return_raw_3d=return_raw_3d,
         )
 
 
@@ -321,7 +354,7 @@ class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
         pretrained_model: str,
         device=None,
         pack_z_stripes: bool = True,
-        pack_border: int = 5,
+        pack_border: int = _PACK_STRIPE_BORDER,
         **kwargs,
     ):
         super().__init__(*args, device=device, **kwargs)
@@ -344,6 +377,8 @@ class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
         anisotropy=1.0,
         do_3D=False,
         plane_weights=None,
+        return_raw_3d=False,
+        **kwargs,
     ):
         if self._should_use_packing(do_3D, anisotropy):
             return self._run_packed_3d(
@@ -355,6 +390,7 @@ class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
                 bsize=bsize,
                 anisotropy=anisotropy,
                 plane_weights=plane_weights,
+                return_raw_3d=return_raw_3d,
             )
         return super()._run_net(
             x,
@@ -367,6 +403,7 @@ class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
             anisotropy=anisotropy,
             do_3D=do_3D,
             plane_weights=plane_weights,
+            return_raw_3d=return_raw_3d,
         )
 
 
@@ -379,7 +416,7 @@ class CellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
         pretrained_model: str,
         device=None,
         pack_z_stripes: bool = True,
-        pack_border: int = 5,
+        pack_border: int = _PACK_STRIPE_BORDER,
         **kwargs,
     ):
         super().__init__(*args, device=device, **kwargs)
@@ -402,6 +439,8 @@ class CellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
         anisotropy=1.0,
         do_3D=False,
         plane_weights=None,
+        return_raw_3d=False,
+        **kwargs,
     ):
         return super()._run_net(
             x,
@@ -414,4 +453,5 @@ class CellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
             anisotropy=anisotropy,
             do_3D=do_3D,
             plane_weights=plane_weights,
+            return_raw_3d=return_raw_3d,
         )
