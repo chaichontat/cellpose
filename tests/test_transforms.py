@@ -25,6 +25,76 @@ def test_random_rotate_and_resize__default():
     random_rotate_and_resize(X)
 
 
+def test_random_rotate_and_resize_preserves_image_label_overlay():
+    # Training-style 3-channel images: random affine + flip should keep
+    # image and label geometry aligned for the mask-like channel.
+    nimg = 2
+    H, W = 64, 64
+    X = []
+    Y = []
+    for _ in range(nimg):
+        img = np.zeros((3, H, W), dtype=np.float32)
+        lbl = np.zeros((3, H, W), dtype=np.float32)
+        # Simple square foreground in channel 0
+        img[0, 16:32, 20:36] = 1.0
+        lbl[0, 16:32, 20:36] = 1.0
+        X.append(img)
+        Y.append(lbl)
+
+    imgi, lbl, _ = random_rotate_and_resize(
+        X,
+        Y=Y,
+        scale_range=0.0,  # no scale jitter
+        xy=(H, W),
+        do_3D=False,
+        do_flip=True,
+        rotate=True,
+        rescale=None,
+        unet=False,
+        random_per_image=True,
+    )
+
+    assert imgi.shape[0] == nimg
+    assert lbl.shape[0] == nimg
+    assert imgi.shape[2:] == lbl.shape[2:]
+
+    # Mask support should coincide with bright image regions (channel 0)
+    for n in range(nimg):
+        img_plane = imgi[n, 0]
+        mask_plane = lbl[n, 0]
+        if not np.any(mask_plane > 0.5):
+            # Degenerate case where foreground was cropped out for both;
+            # in that scenario there is no overlay to check.
+            continue
+        assert np.all(img_plane[mask_plane > 0.5] > 0.1)
+        assert np.all(img_plane[mask_plane <= 0.5] < 0.9)
+
+
+def test_random_rotate_and_resize_2d_identity_overlay():
+    # 2D grayscale inputs should be treated as single-channel images and
+    # preserve overlay under identity transform.
+    H, W = 64, 64
+    X = [np.full((H, W), 1.0, dtype=np.float32)]
+    Y = [np.full((H, W), 1.0, dtype=np.float32)]
+
+    imgi, lbl, _ = random_rotate_and_resize(
+        X,
+        Y=Y,
+        scale_range=0.0,
+        xy=(H, W),
+        do_3D=False,
+        do_flip=False,
+        rotate=False,
+        rescale=None,
+        unet=False,
+        random_per_image=True,
+    )
+
+    assert imgi.shape == (1, 1, H, W)
+    assert lbl.shape == (1, 1, H, W)
+    assert np.allclose(imgi[0, 0], lbl[0, 0])
+
+
 def test_normalize_img(img_3d):
     img_norm = normalize_img(img_3d, norm3D=True)
     assert img_norm.shape == img_3d.shape

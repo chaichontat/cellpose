@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from cellpose import io, models
-from cellpose.contrib.pack_utils import compute_max_guard, compute_stripe_layout, pack_planes_to_stripes
+from cellpose.contrib.pack_utils import compute_stripe_layout, pack_planes_to_stripes
 from cellpose.train import _PACK_STRIPE_BORDER, _ScaledTileSaver
 from scripts.save_packed_masks import PackedCellposeModel, run_model
 
@@ -132,7 +132,6 @@ def _save_scaled_tiles(
     debug_save_scaled_dir: Path | None,
     debug_save_scaled_limit: int,
     debug_save_packed_dir: Path | None,
-    pack_k: int,
     bsize: int,
     pack_border: int,
     flow_model: models.CellposeModel | None,
@@ -155,7 +154,6 @@ def _save_scaled_tiles(
     packed_path, packed_flow_path = _save_packed_patch(
         processed,
         output_dir=debug_save_packed_dir,
-        pack_k=pack_k,
         bsize=bsize,
         pack_border=pack_border,
         flow_model=flow_model,
@@ -168,7 +166,6 @@ def _save_packed_patch(
     stripes_cf: list[np.ndarray],
     *,
     output_dir: Path | None,
-    pack_k: int,
     bsize: int,
     pack_border: int,
     flow_model: models.CellposeModel | None,
@@ -178,17 +175,10 @@ def _save_packed_patch(
         return None, None
     stack = np.stack([np.transpose(tile, (1, 2, 0)) for tile in stripes_cf], axis=0)
     Ly = stack.shape[1]
-    guard_eff = compute_max_guard(
-        int(Ly),
-        bsize=bsize,
-        pack_k=pack_k,
-        border=pack_border,
-    )
+    # K and guard are auto-selected by compute_stripe_layout
     layout = compute_stripe_layout(
         Ly,
         bsize=bsize,
-        pack_k=pack_k,
-        guard=guard_eff,
         border=pack_border,
     )
     if layout is None:
@@ -250,8 +240,6 @@ def evaluate(
     image_path: Path,
     model_path: str,
     gpu: bool,
-    pack_guard: int,
-    pack_k: int,
     ribbon_count: int,
     extra_square: Path | None,
     square_count: int,
@@ -266,11 +254,10 @@ def evaluate(
         stripes.extend(prepare_square_stripes(extra_square, square_count))
 
     baseline = models.CellposeModel(gpu=gpu, pretrained_model=model_path)
+    # K is now auto-selected with guard >= 5
     packed = PackedCellposeModel(
         gpu=gpu,
         pretrained_model=model_path,
-        pack_guard=pack_guard,
-        pack_k=pack_k,
     )
 
     scaled_stats, packed_path, packed_flow_path = _save_scaled_tiles(
@@ -278,7 +265,6 @@ def evaluate(
         debug_save_scaled_dir=debug_save_scaled_dir,
         debug_save_scaled_limit=debug_save_scaled_limit,
         debug_save_packed_dir=debug_save_packed_dir,
-        pack_k=pack_k,
         bsize=BSIZE,
         pack_border=PACK_BORDER,
         flow_model=packed,
@@ -390,8 +376,6 @@ def main():
         args.image,
         args.model,
         args.gpu,
-        args.pack_guard,
-        args.pack_k,
         args.ribbon_count,
         args.extra_square,
         args.square_count,

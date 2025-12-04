@@ -2,6 +2,7 @@ from cellpose import io, models, train
 from subprocess import check_output, STDOUT
 import os, shutil
 import torch
+import numpy as np
 from pathlib import Path
 
 
@@ -23,6 +24,96 @@ def test_class_train(data_dir):
     io.add_model(cpmodel_path)
     io.remove_model(cpmodel_path, delete=True)
     print('>>>> model trained and saved to %s' % cpmodel_path)
+
+
+def test_process_train_test_diameter_override_skips_inference(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_diameters(lbl):
+        calls["count"] += 1
+        return 10.0, [1]
+
+    monkeypatch.setattr(train.utils, "diameters", fake_diameters)
+
+    img = np.zeros((3, 3), dtype=np.float32)
+    lbl = np.array([[0, 1, 1], [0, 2, 2], [0, 0, 0]], dtype=np.int32)
+
+    out = train._process_train_test(
+        train_data=[img],
+        train_labels=[lbl],
+        train_files=None,
+        train_labels_files=None,
+        train_probs=None,
+        test_data=None,
+        test_labels=None,
+        test_files=None,
+        test_labels_files=None,
+        test_probs=None,
+        load_files=True,
+        min_train_masks=0,
+        compute_flows=False,
+        normalize_params={"normalize": False},
+        channel_axis=None,
+        device=torch.device("cpu"),
+        diameter_override=60.0,
+    )
+
+    diam_train = out[5]
+    assert np.allclose(diam_train, 60.0)
+    assert calls["count"] == 0
+
+
+def test_process_train_test_diameter_override_filters_empty_masks(monkeypatch):
+    # Avoid heavy flow computation
+    def fake_labels_to_flows(labels, **_kwargs):
+        flows = []
+        for lbl in labels:
+            lbl = np.asarray(lbl)
+            flows.append(
+                np.stack(
+                    (
+                        lbl,
+                        np.zeros_like(lbl),
+                        np.zeros_like(lbl),
+                        np.zeros_like(lbl),
+                    ),
+                    axis=0,
+                )
+            )
+        return flows
+
+    monkeypatch.setattr(train.dynamics, "labels_to_flows", fake_labels_to_flows)
+
+    img = np.zeros((3, 3), dtype=np.float32)
+    lbl_empty = np.zeros((3, 3), dtype=np.int32)
+    lbl_full = np.array([[0, 1, 1], [0, 2, 2], [0, 0, 0]], dtype=np.int32)
+
+    out = train._process_train_test(
+        train_data=[img, img],
+        train_labels=[lbl_empty, lbl_full],
+        train_files=None,
+        train_labels_files=None,
+        train_probs=None,
+        test_data=None,
+        test_labels=None,
+        test_files=None,
+        test_labels_files=None,
+        test_probs=None,
+        load_files=True,
+        min_train_masks=1,
+        compute_flows=False,
+        normalize_params={"normalize": False},
+        channel_axis=None,
+        device=torch.device("cpu"),
+        diameter_override=60.0,
+    )
+
+    train_data_out = out[0]
+    diam_train = out[5]
+
+    # The empty-mask sample should be filtered out when diameter_override is used
+    assert len(train_data_out) == 1
+    assert np.allclose(diam_train, 60.0)
 
 
 def test_cli_train(data_dir):
