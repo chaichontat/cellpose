@@ -165,7 +165,7 @@ def _forward(net, x):
             dtype = torch.float32
     X = _to_device(x, device=net.device, dtype=dtype)
     net.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         y, style = net(X)[:2]
     del X
     y = _from_device(y)
