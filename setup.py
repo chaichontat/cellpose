@@ -7,14 +7,18 @@ install_deps = [
     'natsort',
     'tifffile',
     'tqdm',
-    'torch>=1.6',
+    'torch>=2.9',
     'torchvision',
     'opencv-python-headless',
     'fastremap',
     'imagecodecs',
     'roifile',
     'fill-voids',
-    'segment_anything @ git+https://github.com/chaichontat/segment-anything.git'
+    'segment_anything @ git+https://github.com/chaichontat/segment-anything.git',
+    'tensorrt-cu12<10.14',
+    'onnx>=1.20.0',
+    'onnxruntime-gpu>=1.23.2',
+    'onnxscript>=0.5.6'
 ]
 
 image_deps = ['nd2', 'pynrrd']
