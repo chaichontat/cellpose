@@ -1,22 +1,41 @@
 """
 Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer , Michael Rariden and Marius Pachitariu.
 """
+import logging
 import os
-from scipy.ndimage import find_objects, center_of_mass, mean
-import torch
+
+import fastremap
 import numpy as np
 import tifffile
+import torch
+from scipy.ndimage import (
+    center_of_mass,
+    find_objects,
+    gaussian_filter,
+    generate_binary_structure,
+    mean,
+)
+from scipy.ndimage import label as scipy_label
 from tqdm import trange
-import fastremap
-
-import logging
 
 dynamics_logger = logging.getLogger(__name__)
 
-from . import utils
-
 import torch
 import torch.nn.functional as F
+
+from . import utils
+
+# CuPy GPU acceleration for KDE clustering
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import gaussian_filter as gaussian_filter_gpu
+    from cupyx.scipy.ndimage import label as label_gpu
+    CUPY_ENABLED = True
+except ImportError:
+    CUPY_ENABLED = False
+    cp = None
+    gaussian_filter_gpu = None
+    label_gpu = None
 
 # -----------------------------------------------------------------------------
 # get_masks_torch hyperparameters
@@ -32,7 +51,7 @@ GET_MASKS_RPAD: int = 20
 GET_MASKS_PEAK_KERNEL_SIZE: int = 6
 
 # Minimum number of endpoints at a voxel to consider it a valid peak.
-GET_MASKS_MIN_PEAK_COUNT: int = 12
+GET_MASKS_MIN_PEAK_COUNT: int = 36
 
 # Half-width (in voxels) of the local window used around each peak during
 # seed growth. The full window size is (2 * radius + 1) in each dimension.
@@ -46,6 +65,15 @@ GET_MASKS_SEED_GROW_KERNEL_SIZE: int = 3
 
 # Minimum local histogram value required to include a voxel in a grown seed.
 GET_MASKS_SEED_DENSITY_THRESHOLD: int = 2
+
+# -----------------------------------------------------------------------------
+# get_masks_kde hyperparameters (u-Segment3D style)
+# -----------------------------------------------------------------------------
+# Gaussian sigma for KDE smoothing of the endpoint histogram.
+GET_MASKS_KDE_SIGMA: float = 1.0
+
+# Multiplier k for adaptive threshold: threshold = mean(rho) + k * std(rho).
+GET_MASKS_KDE_THRESHOLD_K: float = 1.0
 
 def _extend_centers_gpu(neighbors, meds, isneighbor, shape, n_iter=200,
                         device=torch.device("cpu")):
@@ -340,25 +368,31 @@ def flow_error(maski, dP_net, device=None):
     return flow_errors, dP_masks
 
 
-def steps_interp(dP, inds, niter, device=torch.device("cpu")):
-    """ Run dynamics of pixels to recover masks in 2D/3D, with interpolation between pixel values.
+def steps_interp(dP, inds, niter, device=torch.device("cpu"),
+                 momentum=0.0, step_decay=0.0):
+    """Run dynamics of pixels to recover masks in 2D/3D, with interpolation.
 
-    Euler integration of dynamics dP for niter steps.
+    Euler integration of dynamics dP for niter steps, with optional momentum
+    and step decay based on u-Segment3D's suppressed gradient descent.
+
+    The update rule with momentum is:
+        effective = (delta * gradient + mu * prev_momentum) / (delta + mu)
+        eta = delta / (1 + tau * t)
+        position += eta * effective
 
     Args:
-        p (numpy.ndarray): Array of shape (n_points, 2 or 3) representing the initial pixel locations.
-        dP (numpy.ndarray): Array of shape (2, Ly, Lx) or (3, Lz, Ly, Lx) representing the flow field.
+        dP (numpy.ndarray): Flow field of shape (2, Ly, Lx) or (3, Lz, Ly, Lx).
+        inds (tuple): Indices of foreground pixels to track.
         niter (int): Number of iterations to perform.
-        device (torch.device, optional): Device to use for computation. Defaults to None.
+        device (torch.device): Device for computation. Defaults to CPU.
+        momentum (float): Momentum coefficient (mu). Default 0.0 (no momentum).
+            u-Segment3D uses 0.95.
+        step_decay (float): Decay factor (tau) for step size. Default 0.0 (constant step).
+            u-Segment3D uses ~0.01. Step size at iteration t is 1/(1 + tau*t).
 
     Returns:
-        numpy.ndarray: Array of shape (n_points, 2) or (n_points, 3) representing the final pixel locations.
-
-    Raises:
-        None
-
+        numpy.ndarray: Final pixel locations, shape (ndim, n_points).
     """
-
     shape = dP.shape[1:]
     ndim = len(shape)
 
@@ -372,28 +406,50 @@ def steps_interp(dP, inds, niter, device=torch.device("cpu")):
         else:
             pt[0, 0, :, ndim - n - 1] = torch.from_numpy(inds[n]).to(device, dtype=torch.float32)
         im[0, ndim - n - 1] = torch.from_numpy(dP[n]).to(device, dtype=torch.float32)
-    shape = np.array(shape)[::-1].astype("float") - 1
+    shape_arr = np.array(shape)[::-1].astype("float") - 1
 
-    # normalize pt between  0 and  1, normalize the flow
+    # normalize pt between 0 and 1, normalize the flow
     for k in range(ndim):
-        im[:, k] *= 2. / shape[k]
-        pt[..., k] /= shape[k]
+        im[:, k] *= 2. / shape_arr[k]
+        pt[..., k] /= shape_arr[k]
 
     # normalize to between -1 and 1
     pt *= 2
     pt -= 1
 
-    # dynamics
+    # dynamics with optional momentum and step decay
+    use_momentum = momentum > 0
+    if use_momentum:
+        # Initialize momentum buffer (same shape as gradient output)
+        mom_buffer = torch.zeros_like(pt)
+        delta = 1.0
+        norm_factor = 1.0 / (delta + momentum)
+
     for t in range(niter):
         dPt = torch.nn.functional.grid_sample(im, pt, align_corners=False)
-        for k in range(ndim):  #clamp the final pixel locations
-            pt[..., k] = torch.clamp(pt[..., k] + dPt[:, k], -1., 1.)
 
-    #undo the normalization from before, reverse order of operations
+        # Decaying step size: eta = 1 / (1 + tau * t)
+        if step_decay > 0:
+            eta = 1.0 / (1.0 + step_decay * t)
+        else:
+            eta = 1.0
+
+        if use_momentum:
+            # Blend current gradient with previous momentum
+            # effective = (delta * gradient + mu * momentum) / (delta + mu)
+            for k in range(ndim):
+                effective = (delta * dPt[:, k] + momentum * mom_buffer[..., k]) * norm_factor
+                mom_buffer[..., k] = effective
+                pt[..., k] = torch.clamp(pt[..., k] + eta * effective, -1., 1.)
+        else:
+            for k in range(ndim):
+                pt[..., k] = torch.clamp(pt[..., k] + eta * dPt[:, k], -1., 1.)
+
+    # undo the normalization from before, reverse order of operations
     pt += 1
     pt *= 0.5
     for k in range(ndim):
-        pt[..., k] *= shape[k]
+        pt[..., k] *= shape_arr[k]
 
     if ndim==3:
         pt = pt[..., [2, 1, 0]].squeeze()
@@ -404,28 +460,32 @@ def steps_interp(dP, inds, niter, device=torch.device("cpu")):
         pt = pt.unsqueeze(0) if pt.ndim==1 else pt
         return pt.T
 
-def follow_flows(dP, inds, niter=200, device=torch.device("cpu")):
-    """ Run dynamics to recover masks in 2D or 3D.
+def follow_flows(dP, inds, niter=250, device=torch.device("cpu"),
+                 momentum=0.0, step_decay=0.0):
+    """Run dynamics to recover masks in 2D or 3D.
 
     Pixels are represented as a meshgrid. Only pixels with non-zero cell-probability
     are used (as defined by inds).
 
     Args:
         dP (np.ndarray): Flows [axis x Ly x Lx] or [axis x Lz x Ly x Lx].
-        mask (np.ndarray, optional): Pixel mask to seed masks. Useful when flows have low magnitudes.
-        niter (int, optional): Number of iterations of dynamics to run. Default is 200.
-        interp (bool, optional): Interpolate during 2D dynamics (not available in 3D). Default is True.
-        device (torch.device, optional): Device to use for computation. Default is None.
+        inds (tuple): Indices of foreground pixels.
+        niter (int): Number of iterations of dynamics to run. Default is 250.
+        device (torch.device): Device to use for computation. Default is CPU.
+        momentum (float): Momentum coefficient for suppressed gradient descent.
+            Default 0.0 (standard Euler). u-Segment3D uses 0.95.
+        step_decay (float): Decay factor for step size. Default 0.0 (constant step).
+            u-Segment3D uses ~0.01. Step size at iteration t is 1/(1 + tau*t).
 
     Returns:
-        A tuple containing (p, inds): p (np.ndarray): Final locations of each pixel after dynamics; [axis x Ly x Lx] or [axis x Lz x Ly x Lx];
-        inds (np.ndarray): Indices of pixels used for dynamics; [axis x Ly x Lx] or [axis x Lz x Ly x Lx].
+        np.ndarray: Final locations of each pixel after dynamics, shape (ndim, n_points).
     """
-    shape = np.array(dP.shape[1:]).astype(np.int32)
-    ndim = len(inds)
-
-    p = steps_interp(dP, inds, niter, device=device)
-
+    dynamics_logger.info(
+        f"follow_flows: niter={niter}, momentum={momentum}, step_decay={step_decay}, "
+        f"n_pixels={len(inds[0])}, shape={dP.shape[1:]}"
+    )
+    p = steps_interp(dP, inds, niter, device=device,
+                     momentum=momentum, step_decay=step_decay)
     return p
 
 
@@ -645,25 +705,174 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
     return M0
 
 
-def resize_and_compute_masks(dP, cellprob, niter=200, cellprob_threshold=0.0,
+def get_masks_kde(pt, inds, shape0, rpad=None, max_size_fraction=0.4,
+                  kde_sigma=None, kde_threshold_k=None, use_gpu=True):
+    """Create masks using KDE-based clustering (u-Segment3D approach).
+
+    This replaces the peak detection + seed growth approach with:
+    1. Build histogram from flow endpoints
+    2. Apply Gaussian filter (KDE smoothing) with sigma=kde_sigma
+    3. Compute adaptive threshold: mean(rho) + k * std(rho)
+    4. Run connected components on thresholded density
+    5. Map original pixels to cluster labels via endpoint lookup
+
+    Args:
+        pt: Final pixel locations after dynamics, shape (ndim, n_points).
+        inds: Tuple of indices of foreground pixels.
+        shape0: Original image shape (Ly, Lx) or (Lz, Ly, Lx).
+        rpad: Padding for endpoint coordinates. None uses module default.
+        max_size_fraction: Remove masks larger than this fraction of image.
+        kde_sigma: Gaussian sigma for KDE smoothing. None uses module default (1.0).
+        kde_threshold_k: Threshold multiplier k. None uses module default (1.0).
+        use_gpu: Use CuPy acceleration if available.
+
+    Returns:
+        Labeled mask array, dtype uint16 or uint32.
+    """
+    ndim = len(shape0)
+
+    # Use module-level defaults when None
+    rpad = GET_MASKS_RPAD if rpad is None else rpad
+    kde_sigma = GET_MASKS_KDE_SIGMA if kde_sigma is None else kde_sigma
+    kde_threshold_k = GET_MASKS_KDE_THRESHOLD_K if kde_threshold_k is None else kde_threshold_k
+
+    dynamics_logger.info(
+        f"KDE clustering activated: sigma={kde_sigma}, threshold_k={kde_threshold_k}, "
+        f"shape={shape0}, use_gpu={use_gpu and CUPY_ENABLED}"
+    )
+
+    # Step 1: Build histogram (same as get_masks_torch)
+    pt = pt + rpad
+    pt = torch.clamp(pt, min=0)
+    for i in range(len(pt)):
+        pt[i] = torch.clamp(pt[i], max=shape0[i] + rpad - 1)
+
+    shape = tuple(np.array(shape0) + 2 * rpad)
+    coo = torch.sparse_coo_tensor(
+        pt, torch.ones(pt.shape[1], device=pt.device, dtype=torch.int), shape
+    )
+    h = coo.to_dense()
+    del coo
+    h_np = h.cpu().numpy().astype(np.float32)
+    del h
+
+    # Step 2-4: KDE smoothing, thresholding, and connected components
+    use_cupy = use_gpu and CUPY_ENABLED and torch.cuda.is_available()
+
+    if use_cupy:
+        try:
+            h_gpu = cp.asarray(h_np)
+            del h_np
+            rho = gaussian_filter_gpu(h_gpu, sigma=kde_sigma)
+            del h_gpu
+
+            # Compute stats only on non-zero regions to avoid dilution from padding
+            nonzero_mask = rho > 0
+            if cp.any(nonzero_mask):
+                rho_nonzero = rho[nonzero_mask]
+                rho_mean = float(cp.mean(rho_nonzero))
+                rho_std = float(cp.std(rho_nonzero))
+                del rho_nonzero
+            else:
+                rho_mean, rho_std = 0.0, 0.0
+            del nonzero_mask
+
+            # Step 3: Adaptive threshold
+            threshold = rho_mean + kde_threshold_k * rho_std
+            dynamics_logger.debug(
+                f"KDE stats (GPU): mean={rho_mean:.4f}, std={rho_std:.4f}, threshold={threshold:.4f}"
+            )
+
+            # Step 4: Connected components
+            binary_mask = rho > threshold
+            del rho
+            structure = cp.ones((3,) * ndim, dtype=bool)
+            cluster_labels, n_clusters = label_gpu(binary_mask, structure=structure)
+            del binary_mask
+            cluster_labels_np = cp.asnumpy(cluster_labels)
+            del cluster_labels
+        finally:
+            cp.get_default_memory_pool().free_all_blocks()
+    else:
+        rho = gaussian_filter(h_np, sigma=kde_sigma)
+        del h_np
+
+        # Compute stats only on non-zero regions to avoid dilution from padding
+        nonzero_mask = rho > 0
+        if np.any(nonzero_mask):
+            rho_nonzero = rho[nonzero_mask]
+            rho_mean = float(np.mean(rho_nonzero))
+            rho_std = float(np.std(rho_nonzero))
+            del rho_nonzero
+        else:
+            rho_mean, rho_std = 0.0, 0.0
+        del nonzero_mask
+
+        # Step 3: Adaptive threshold
+        threshold = rho_mean + kde_threshold_k * rho_std
+        dynamics_logger.debug(
+            f"KDE stats (CPU): mean={rho_mean:.4f}, std={rho_std:.4f}, threshold={threshold:.4f}"
+        )
+
+        # Step 4: Connected components
+        binary_mask = rho > threshold
+        del rho
+        structure = generate_binary_structure(ndim, connectivity=ndim)
+        cluster_labels_np, n_clusters = scipy_label(binary_mask, structure=structure)
+        del binary_mask
+
+    dynamics_logger.info(f"KDE clustering found {n_clusters} clusters")
+
+    if n_clusters == 0:
+        dynamics_logger.warning("no clusters found in get_masks_kde - no masks found.")
+        return np.zeros(shape0, dtype="uint16")
+
+    # Step 5: Map pixels to cluster labels via endpoint lookup
+    pt_np = pt.cpu().numpy().astype(np.int64)
+    M1 = cluster_labels_np[tuple(pt_np)]
+    del cluster_labels_np, pt_np
+
+    dtype = "uint16" if n_clusters < 2**16 else "uint32"
+    M0 = np.zeros(shape0, dtype=dtype)
+    M0[inds] = M1.astype(dtype)
+    del M1
+
+    # Step 6: Remove oversized masks
+    uniq, counts = fastremap.unique(M0, return_counts=True)
+    big = np.prod(shape0) * max_size_fraction
+    bigc = uniq[counts > big]
+    if len(bigc) > 0 and (len(bigc) > 1 or bigc[0] != 0):
+        M0 = fastremap.mask(M0, bigc)
+    fastremap.renumber(M0, in_place=True)
+    return M0.reshape(tuple(shape0))
+
+
+def resize_and_compute_masks(dP, cellprob, niter=250, cellprob_threshold=0.0,
                              flow_threshold=0.4, do_3D=False, min_size=15,
-                             max_size_fraction=0.4, resize=None, device=torch.device("cpu")):
+                             max_size_fraction=0.4, resize=None, device=torch.device("cpu"),
+                             momentum=0.0, step_decay=0.0,
+                             use_kde_clustering=False, kde_sigma=1.0, kde_threshold_k=1.0):
     """Compute masks using dynamics from dP and cellprob, and resizes masks if resize is not None.
 
     Args:
         dP (numpy.ndarray): The dynamics flow field array.
         cellprob (numpy.ndarray): The cell probability array.
-        p (numpy.ndarray, optional): The pixels on which to run dynamics. Defaults to None
-        niter (int, optional): The number of iterations for mask computation. Defaults to 200.
+        niter (int, optional): The number of iterations for mask computation. Defaults to 250.
         cellprob_threshold (float, optional): The threshold for cell probability. Defaults to 0.0.
         flow_threshold (float, optional): The threshold for quality control metrics. Defaults to 0.4.
-        interp (bool, optional): Whether to interpolate during dynamics computation. Defaults to True.
         do_3D (bool, optional): Whether to perform mask computation in 3D. Defaults to False.
         min_size (int, optional): The minimum size of the masks. Defaults to 15.
         max_size_fraction (float, optional): Masks larger than max_size_fraction of
             total image size are removed. Default is 0.4.
         resize (tuple, optional): The desired size for resizing the masks. Defaults to None.
         device (torch.device, optional): The device to use for computation. Defaults to torch.device("cpu").
+        momentum (float, optional): Momentum coefficient for suppressed gradient descent.
+            Default 0.0 (standard Euler). u-Segment3D uses 0.95.
+        step_decay (float, optional): Decay factor for step size. Default 0.0 (constant step).
+            u-Segment3D uses ~0.01.
+        use_kde_clustering (bool, optional): Use u-Segment3D KDE-based clustering. Defaults to False.
+        kde_sigma (float, optional): Gaussian sigma for KDE smoothing. Defaults to 1.0.
+        kde_threshold_k (float, optional): Threshold multiplier k. Defaults to 1.0.
 
     Returns:
         tuple: A tuple containing the computed masks and the final pixel locations.
@@ -672,7 +881,9 @@ def resize_and_compute_masks(dP, cellprob, niter=200, cellprob_threshold=0.0,
                             cellprob_threshold=cellprob_threshold,
                             flow_threshold=flow_threshold, do_3D=do_3D,
                             max_size_fraction=max_size_fraction,
-                            device=device)
+                            device=device, momentum=momentum, step_decay=step_decay,
+                            use_kde_clustering=use_kde_clustering,
+                            kde_sigma=kde_sigma, kde_threshold_k=kde_threshold_k)
 
     if resize is not None:
         dynamics_logger.warning("Resizing is deprecated in v4.0.1+")
@@ -682,28 +893,42 @@ def resize_and_compute_masks(dP, cellprob, niter=200, cellprob_threshold=0.0,
     return mask
 
 
-def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
+def compute_masks(dP, cellprob, p=None, niter=250, cellprob_threshold=0.0,
                   flow_threshold=0.4, do_3D=False, min_size=-1,
-                  max_size_fraction=0.4, device=torch.device("cpu")):
+                  max_size_fraction=0.4, device=torch.device("cpu"),
+                  momentum=0.0, step_decay=0.0,
+                  use_kde_clustering=False, kde_sigma=1.0, kde_threshold_k=1.0):
     """Compute masks using dynamics from dP and cellprob.
 
     Args:
         dP (numpy.ndarray): The dynamics flow field array.
         cellprob (numpy.ndarray): The cell probability array.
         p (numpy.ndarray, optional): The pixels on which to run dynamics. Defaults to None
-        niter (int, optional): The number of iterations for mask computation. Defaults to 200.
+        niter (int, optional): The number of iterations for mask computation. Defaults to 250.
         cellprob_threshold (float, optional): The threshold for cell probability. Defaults to 0.0.
         flow_threshold (float, optional): The threshold for quality control metrics. Defaults to 0.4.
-        interp (bool, optional): Whether to interpolate during dynamics computation. Defaults to True.
         do_3D (bool, optional): Whether to perform mask computation in 3D. Defaults to False.
         min_size (int, optional): The minimum size of the masks. Defaults to 15.
         max_size_fraction (float, optional): Masks larger than max_size_fraction of
             total image size are removed. Default is 0.4.
         device (torch.device, optional): The device to use for computation. Defaults to torch.device("cpu").
+        momentum (float, optional): Momentum coefficient for suppressed gradient descent.
+            Default 0.0 (standard Euler). u-Segment3D uses 0.95.
+        step_decay (float, optional): Decay factor for step size. Default 0.0 (constant step).
+            u-Segment3D uses ~0.01.
+        use_kde_clustering (bool, optional): Use u-Segment3D KDE-based clustering instead
+            of peak detection + seed growth. Defaults to False.
+        kde_sigma (float, optional): Gaussian sigma for KDE smoothing. Defaults to 1.0.
+        kde_threshold_k (float, optional): Threshold multiplier k for adaptive threshold
+            (mean + k*std). Defaults to 1.0.
 
     Returns:
         tuple: A tuple containing the computed masks and the final pixel locations.
     """
+    dynamics_logger.info(
+        f"compute_masks: use_kde_clustering={use_kde_clustering}, "
+        f"momentum={momentum}, step_decay={step_decay}, niter={niter}"
+    )
 
     if (cellprob > cellprob_threshold).sum():  #mask at this point is a cell cluster binary map, not labels
         inds = np.nonzero(cellprob > cellprob_threshold)
@@ -714,8 +939,8 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
             return mask
 
         p_final = follow_flows(dP * (cellprob > cellprob_threshold) / 5.,
-                               inds=inds, niter=niter,
-                                device=device)
+                               inds=inds, niter=niter, device=device,
+                               momentum=momentum, step_decay=step_decay)
         if not torch.is_tensor(p_final):
             p_final = torch.from_numpy(p_final).to(device, dtype=torch.int)
         else:
@@ -723,8 +948,14 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
         # calculate masks
         if device.type == "mps":
             p_final = p_final.to(torch.device("cpu"))
-        mask = get_masks_torch(p_final, inds, dP.shape[1:],
-                               max_size_fraction=max_size_fraction)
+        if use_kde_clustering:
+            mask = get_masks_kde(p_final, inds, dP.shape[1:],
+                                 max_size_fraction=max_size_fraction,
+                                 kde_sigma=kde_sigma, kde_threshold_k=kde_threshold_k,
+                                 use_gpu=(device.type == "cuda"))
+        else:
+            mask = get_masks_torch(p_final, inds, dP.shape[1:],
+                                   max_size_fraction=max_size_fraction)
         del p_final
         # flow thresholding factored out of get_masks
         if not do_3D:
@@ -754,23 +985,27 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
 
 
 def compute_masks_unet(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
-                  flow_threshold=0.4, interp=True, do_3D=False, min_size=-1,
-                  max_size_fraction=0.4, device=torch.device("cpu")):
+                  flow_threshold=0.4, do_3D=False, min_size=-1,
+                  max_size_fraction=0.4, device=torch.device("cpu"),
+                  momentum=0.0, step_decay=0.0):
     """Compute masks using dynamics from dP and cellprob.
 
     Args:
         dP (numpy.ndarray): The dynamics flow field array.
         cellprob (numpy.ndarray): The cell probability array.
         p (numpy.ndarray, optional): The pixels on which to run dynamics. Defaults to None
-        niter (int, optional): The number of iterations for mask computation. Defaults to 200.
+        niter (int, optional): The number of iterations for mask computation. Defaults to 250.
         cellprob_threshold (float, optional): The threshold for cell probability. Defaults to 0.0.
         flow_threshold (float, optional): The threshold for quality control metrics. Defaults to 0.4.
-        interp (bool, optional): Whether to interpolate during dynamics computation. Defaults to True.
         do_3D (bool, optional): Whether to perform mask computation in 3D. Defaults to False.
         min_size (int, optional): The minimum size of the masks. Defaults to 15.
         max_size_fraction (float, optional): Masks larger than max_size_fraction of
             total image size are removed. Default is 0.4.
         device (torch.device, optional): The device to use for computation. Defaults to torch.device("cpu").
+        momentum (float, optional): Momentum coefficient for suppressed gradient descent.
+            Default 0.0 (standard Euler). u-Segment3D uses 0.95.
+        step_decay (float, optional): Decay factor for step size. Default 0.0 (constant step).
+            u-Segment3D uses ~0.01.
 
     Returns:
         tuple: A tuple containing the computed masks and the final pixel locations.
@@ -785,8 +1020,8 @@ def compute_masks_unet(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
             return mask
 
         p_final = follow_flows(dP * (cellprob > cellprob_threshold) / 5.,
-                               inds=inds, niter=niter, interp=interp,
-                                device=device)
+                               inds=inds, niter=niter, device=device,
+                               momentum=momentum, step_decay=step_decay)
         if not torch.is_tensor(p_final):
             p_final = torch.from_numpy(p_final).to(device, dtype=torch.int)
         else:

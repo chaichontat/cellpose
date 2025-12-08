@@ -11,13 +11,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from scipy.ndimage import gaussian_filter
 from tqdm import trange
 
 models_logger = logging.getLogger(__name__)
 
 from . import dynamics, plot, transforms, utils
-from .core import assign_device, run_3D, run_net
+from .core import assign_device, run_3D, run_net, _smooth_flows_3d
 from .vit_sam import Transformer
 
 _CPSAM_MODEL_URL = "https://huggingface.co/mouseland/cellpose-sam/resolve/main/cpsam"
@@ -193,11 +192,13 @@ class CellposeModel():
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,
              flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
-             flow3D_smooth=0, ortho_weights=None, stitch_threshold=0.0,
+             flow3D_smooth=0, flow2D_smooth=0.0, ortho_weights=None, stitch_threshold=0.0,
              min_size=15, max_size_fraction=0.4, niter=None,
              augment=False, tile_overlap=0.1, bsize=256,
              compute_masks=True, progress=None,
-             return_raw_3d=False):
+             return_raw_3d=False, momentum=0.0, step_decay=0.0,
+             use_kde_clustering=False, kde_sigma=1.0, kde_threshold_k=1.0,
+             use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5):
         """ segment list of images x, or 4D array - Z x 3 x Y x X
 
         Args:
@@ -289,9 +290,18 @@ class CellposeModel():
                     max_size_fraction=max_size_fraction,
                     stitch_threshold=stitch_threshold,
                     flow3D_smooth=flow3D_smooth,
+                    flow2D_smooth=flow2D_smooth,
                     ortho_weights=ortho_weights,
                     progress=progress,
-                    niter=niter)
+                    niter=niter,
+                    momentum=momentum,
+                    step_decay=step_decay,
+                    use_kde_clustering=use_kde_clustering,
+                    kde_sigma=kde_sigma,
+                    kde_threshold_k=kde_threshold_k,
+                    use_variance_fusion=use_variance_fusion,
+                    variance_alpha_flow=variance_alpha_flow,
+                    variance_alpha_cellprob=variance_alpha_cellprob)
                 masks.append(maski)
                 flows.append(flowi)
                 styles.append(stylei)
@@ -359,7 +369,11 @@ class CellposeModel():
             do_3D=do_3D,
             anisotropy=anisotropy,
             plane_weights=ortho_weights,
-            return_raw_3d=return_raw_3d and do_3D)
+            return_raw_3d=return_raw_3d and do_3D,
+            flow2D_smooth=flow2D_smooth,
+            use_variance_fusion=use_variance_fusion,
+            variance_alpha_flow=variance_alpha_flow,
+            variance_alpha_cellprob=variance_alpha_cellprob)
 
         if return_raw_3d and do_3D:
             return run_net_outputs
@@ -369,8 +383,7 @@ class CellposeModel():
 
         if do_3D:
             if flow3D_smooth > 0:
-                models_logger.info(f"smoothing flows with sigma={flow3D_smooth}")
-                dP = gaussian_filter(dP, (0, flow3D_smooth, flow3D_smooth, flow3D_smooth))
+                dP = _smooth_flows_3d(dP, sigma=flow3D_smooth, use_gpu=True)
             torch.cuda.empty_cache()
             gc.collect()
 
@@ -386,7 +399,10 @@ class CellposeModel():
             masks = self._compute_masks(x.shape, dP, cellprob, flow_threshold=flow_threshold,
                             cellprob_threshold=cellprob_threshold, min_size=min_size,
                         max_size_fraction=max_size_fraction, niter=niter,
-                        stitch_threshold=stitch_threshold, do_3D=do_3D)
+                        stitch_threshold=stitch_threshold, do_3D=do_3D,
+                        momentum=momentum, step_decay=step_decay,
+                        use_kde_clustering=use_kde_clustering,
+                        kde_sigma=kde_sigma, kde_threshold_k=kde_threshold_k)
         else:
             masks = np.zeros(0) #pass back zeros if not compute_masks
 
@@ -503,7 +519,8 @@ class CellposeModel():
                 batch_size=8, tile_overlap=0.1,
                 bsize=256, anisotropy=1.0, do_3D=False,
                 plane_weights=None,
-                return_raw_3d=False):
+                return_raw_3d=False, flow2D_smooth=0.0,
+                use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5):
         """ run network on image x """
         tic = time.time()
         shape = x.shape
@@ -528,6 +545,10 @@ class CellposeModel():
                     net_ortho=self.net_ortho,
                     plane_weights=plane_weights,
                     return_raw=True,
+                    flow2D_smooth=flow2D_smooth,
+                    use_variance_fusion=use_variance_fusion,
+                    variance_alpha_flow=variance_alpha_flow,
+                    variance_alpha_cellprob=variance_alpha_cellprob,
                 )
                 return raw_outputs
 
@@ -540,6 +561,10 @@ class CellposeModel():
                 bsize=bsize,
                 net_ortho=self.net_ortho,
                 plane_weights=plane_weights,
+                flow2D_smooth=flow2D_smooth,
+                use_variance_fusion=use_variance_fusion,
+                variance_alpha_flow=variance_alpha_flow,
+                variance_alpha_cellprob=variance_alpha_cellprob,
             )
             cellprob = yf[..., -1]
             dP = yf[..., :-1].transpose((3, 0, 1, 2))
@@ -563,7 +588,8 @@ class CellposeModel():
 
     def _compute_masks(self, shape, dP, cellprob, flow_threshold=0.4, cellprob_threshold=0.0,
                        min_size=15, max_size_fraction=0.4, niter=None,
-                       do_3D=False, stitch_threshold=0.0):
+                       do_3D=False, stitch_threshold=0.0, momentum=0.0, step_decay=0.0,
+                       use_kde_clustering=False, kde_sigma=1.0, kde_threshold_k=1.0):
         """ compute masks from flows and cell probability """
         changed_device_from = None
         if self.device.type == "mps" and do_3D:
@@ -579,7 +605,9 @@ class CellposeModel():
                 min_size=min_size, max_size_fraction=max_size_fraction,
                 resize=shape[:3] if (np.array(dP.shape[-3:])!=np.array(shape[:3])).sum()
                         else None,
-                device=self.device)
+                device=self.device, momentum=momentum, step_decay=step_decay,
+                use_kde_clustering=use_kde_clustering,
+                kde_sigma=kde_sigma, kde_threshold_k=kde_threshold_k)
         else:
             nimg = shape[0]
             Ly0, Lx0 = cellprob[0].shape
@@ -595,7 +623,9 @@ class CellposeModel():
                     niter=niter, cellprob_threshold=cellprob_threshold,
                     flow_threshold=flow_threshold, resize=resize,
                     min_size=min_size0, max_size_fraction=max_size_fraction,
-                    device=self.device)
+                    device=self.device, momentum=momentum, step_decay=step_decay,
+                    use_kde_clustering=use_kde_clustering,
+                    kde_sigma=kde_sigma, kde_threshold_k=kde_threshold_k)
                 if i==0 and nimg > 1:
                     masks = np.zeros((nimg, shape[1], shape[2]), outputs.dtype)
                 if nimg > 1:

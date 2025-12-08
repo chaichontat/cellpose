@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+
 from cellpose import models, transforms
 from cellpose.contrib.cellposetrt import CellposeModelTRT as _CellposeModelTRT
-from cellpose.core import run_net
+from cellpose.core import _compute_variance_weights, _smooth_flows_2d, run_net
 from cellpose.train import _PACK_STRIPE_BORDER
 from cellpose.unet import CellposeUNetModel
 
@@ -29,8 +30,12 @@ def _run_3d_with_packing(
     pack_border: int,
     plane_weights: np.ndarray | None,
     return_raw_3d: bool = False,
-    **kwargs
+    flow2D_smooth: float = 0.0,
+    use_variance_fusion: bool = False,
+    variance_alpha_flow: float = 0.5,
+    variance_alpha_cellprob: float = 1e-5,
 ):
+    # No **kwargs - all parameters must be explicitly defined
     sstr = ["YX", "ZY", "ZX"]
     orient_keys = ["xy", "xz", "yz"]  # align with core.run_3D return_raw contract
     pm = [(0, 1, 2, 3), (1, 0, 2, 3), (2, 0, 1, 3)]
@@ -52,8 +57,14 @@ def _run_3d_with_packing(
             raise ValueError("plane_weights entries must be non-negative.")
         if np.all(weights == 0):
             raise ValueError("At least one plane weight must be positive.")
-    flow_weight_totals = np.zeros(3, dtype=np.float32)
-    cellprob_weight_total = 0.0
+
+    # Initialize weight accumulators - arrays when using variance fusion, scalars otherwise
+    if use_variance_fusion:
+        flow_weight_totals = [np.zeros(shape, dtype=np.float32) for _ in range(3)]
+        cellprob_weight_total = np.zeros(shape, dtype=np.float32)
+    else:
+        flow_weight_totals = np.zeros(3, dtype=np.float32)
+        cellprob_weight_total = 0.0
     raw_outputs = {}
 
     for p in range(3):
@@ -104,26 +115,56 @@ def _run_3d_with_packing(
                 bsize=bsize,
             )
 
+        # Apply 2D pre-smoothing before aggregation (u-Segment3D)
+        if flow2D_smooth > 0:
+            y = _smooth_flows_2d(y, sigma=flow2D_smooth, use_gpu=True)
+
         if return_raw_3d:
             raw_outputs[orient_keys[p]] = {"y": y, "style": styles}
             continue
 
         styles_last = styles
-        yf[..., -1] += weight * y[..., -1].transpose(ipm[p])
-        cellprob_weight_total += weight
-        for j in range(2):
-            axis_idx = cp[p][j]
-            yf[..., axis_idx] += weight * y[..., cpy[p][j]].transpose(ipm[p])
-            flow_weight_totals[axis_idx] += weight
+
+        if use_variance_fusion:
+            # Variance-weighted fusion: weight by inverse local variance
+            cellprob_3d = y[..., -1].transpose(ipm[p])
+            w_cellprob = _compute_variance_weights(
+                cellprob_3d, alpha=variance_alpha_cellprob, use_gpu=True)
+            yf[..., -1] += weight * w_cellprob * cellprob_3d
+            cellprob_weight_total += weight * w_cellprob
+
+            for j in range(2):
+                axis_idx = cp[p][j]
+                flow_3d = y[..., cpy[p][j]].transpose(ipm[p])
+                w_flow = _compute_variance_weights(
+                    flow_3d, alpha=variance_alpha_flow, use_gpu=True)
+                yf[..., axis_idx] += weight * w_flow * flow_3d
+                flow_weight_totals[axis_idx] += weight * w_flow
+        else:
+            # Original simple weighted accumulation
+            yf[..., -1] += weight * y[..., -1].transpose(ipm[p])
+            cellprob_weight_total += weight
+            for j in range(2):
+                axis_idx = cp[p][j]
+                yf[..., axis_idx] += weight * y[..., cpy[p][j]].transpose(ipm[p])
+                flow_weight_totals[axis_idx] += weight
 
     if return_raw_3d:
         return raw_outputs
 
-    for axis_idx in range(3):
-        if flow_weight_totals[axis_idx] > 0:
-            yf[..., axis_idx] /= flow_weight_totals[axis_idx]
-    if cellprob_weight_total > 0:
-        yf[..., -1] /= cellprob_weight_total
+    # Normalize by accumulated weights
+    if use_variance_fusion:
+        for axis_idx in range(3):
+            mask = flow_weight_totals[axis_idx] > 0
+            yf[..., axis_idx][mask] /= flow_weight_totals[axis_idx][mask]
+        mask = cellprob_weight_total > 0
+        yf[..., -1][mask] /= cellprob_weight_total[mask]
+    else:
+        for axis_idx in range(3):
+            if flow_weight_totals[axis_idx] > 0:
+                yf[..., axis_idx] /= flow_weight_totals[axis_idx]
+        if cellprob_weight_total > 0:
+            yf[..., -1] /= cellprob_weight_total
 
     return yf, styles_last
 
@@ -151,7 +192,7 @@ class Packed3DMixin:
         bsize: int,
         anisotropy: float | int | None = 1.0,
         return_raw_3d: bool = False,
-        **kwargs
+        **kwargs,
     ):
         # Mirror baseline behavior: if anisotropy is provided and != 1.0, resize Y accordingly
         if isinstance(anisotropy, (float, int)) and anisotropy not in (None, 1.0):
@@ -161,6 +202,7 @@ class Packed3DMixin:
                 Ly=int(Lz * float(anisotropy)),
                 Lx=int(Lx),
             ).transpose(1, 0, 2, 3)
+        # _run_3d_with_packing has explicit params - will error on unknown kwargs
         res = _run_3d_with_packing(
             net,
             x,
@@ -170,7 +212,7 @@ class Packed3DMixin:
             bsize=bsize,
             pack_border=getattr(self, "_pack_border", _PACK_STRIPE_BORDER),
             return_raw_3d=return_raw_3d,
-            **kwargs
+            **kwargs,
         )
         if return_raw_3d:
             return res
@@ -219,7 +261,7 @@ class PackedCellposeModel(Packed3DMixin, models.CellposeModel):
                 anisotropy=anisotropy,
                 plane_weights=plane_weights,
                 return_raw_3d=return_raw_3d,
-                **kwargs
+                **kwargs,
             )
 
         return super()._run_net(
@@ -232,7 +274,7 @@ class PackedCellposeModel(Packed3DMixin, models.CellposeModel):
             do_3D=do_3D,
             plane_weights=plane_weights,
             return_raw_3d=return_raw_3d,
-            **kwargs
+            **kwargs,
         )
 
 
@@ -272,7 +314,7 @@ class PackedCellposeModelTRT(Packed3DMixin, _CellposeModelTRT):
                 anisotropy=anisotropy,
                 plane_weights=plane_weights,
                 return_raw_3d=return_raw_3d,
-                **kwargs
+                **kwargs,
             )
 
         return super()._run_net(
@@ -285,7 +327,7 @@ class PackedCellposeModelTRT(Packed3DMixin, _CellposeModelTRT):
             do_3D=do_3D,
             plane_weights=plane_weights,
             return_raw_3d=return_raw_3d,
-            **kwargs
+            **kwargs,
         )
 
 
@@ -329,6 +371,7 @@ class PackedCellposeUNetModel(Packed3DMixin, CellposeUNetModel):
                 anisotropy=anisotropy,
                 plane_weights=plane_weights,
                 return_raw_3d=return_raw_3d,
+                **kwargs,
             )
         return super()._run_net(
             x,
@@ -391,6 +434,7 @@ class PackedCellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
                 anisotropy=anisotropy,
                 plane_weights=plane_weights,
                 return_raw_3d=return_raw_3d,
+                **kwargs,
             )
         return super()._run_net(
             x,
@@ -454,4 +498,5 @@ class CellposeUNetModelTRT(Packed3DMixin, CellposeUNetModel):
             do_3D=do_3D,
             plane_weights=plane_weights,
             return_raw_3d=return_raw_3d,
+            **kwargs,
         )

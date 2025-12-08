@@ -3,16 +3,129 @@ Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer ,
 """
 import logging
 
+import cupy as cp
 import numpy as np
 import torch
+from cupyx.scipy.ndimage import gaussian_filter as gaussian_filter_gpu
+from cupyx.scipy.ndimage import uniform_filter as uniform_filter_gpu
+from scipy.ndimage import gaussian_filter, uniform_filter
 from tqdm import trange
 
 from . import transforms, utils
 
 TORCH_ENABLED = True
+CUPY_ENABLED = True
 
 core_logger = logging.getLogger(__name__)
 tqdm_out = utils.TqdmToLogger(core_logger, level=logging.INFO)
+
+
+
+def _smooth_flows_2d(y, sigma, use_gpu=True):
+    """Apply 2D Gaussian smoothing to flow fields in-place when possible.
+
+    Args:
+        y: Array of shape [num_slices, H, W, 3] where last dim is [flow_y, flow_x, cellprob].
+        sigma: Gaussian sigma for smoothing.
+        use_gpu: If True and CuPy available, use GPU acceleration.
+
+    Returns:
+        Smoothed array of same shape.
+    """
+    if sigma <= 0:
+        return y
+
+    if use_gpu and CUPY_ENABLED and torch.cuda.is_available():
+        # Use CuPy for GPU-accelerated smoothing
+        y_gpu = cp.asarray(y)
+        del y  # Free input array immediately
+        # Smooth only flow components (first 2 channels), not cellprob
+        for c in range(2):
+            for z in range(y_gpu.shape[0]):
+                y_gpu[z, :, :, c] = gaussian_filter_gpu(y_gpu[z, :, :, c], sigma=sigma)
+        y_smoothed = cp.asnumpy(y_gpu)
+        del y_gpu
+        cp.get_default_memory_pool().free_all_blocks()
+    else:
+        # CPU fallback - modify in place
+        for c in range(2):
+            for z in range(y.shape[0]):
+                y[z, :, :, c] = gaussian_filter(y[z, :, :, c], sigma=sigma)
+        y_smoothed = y
+
+    return y_smoothed
+
+
+def _smooth_flows_3d(dP, sigma, use_gpu=True):
+    """Apply 3D Gaussian smoothing to flow fields.
+
+    Args:
+        dP: Array of shape [3, Z, Y, X] where first dim is flow components (dz, dy, dx).
+        sigma: Gaussian sigma for smoothing spatial dimensions.
+        use_gpu: If True and CuPy available, use GPU acceleration.
+
+    Returns:
+        Smoothed array of same shape.
+    """
+    if sigma <= 0:
+        return dP
+
+    core_logger.info(f"smoothing 3D flows with sigma={sigma}, use_gpu={use_gpu and CUPY_ENABLED}")
+
+    if use_gpu and CUPY_ENABLED and torch.cuda.is_available():
+        try:
+            dP_gpu = cp.asarray(dP)
+            # Smooth each flow component separately in 3D
+            for c in range(dP_gpu.shape[0]):
+                dP_gpu[c] = gaussian_filter_gpu(dP_gpu[c], sigma=sigma)
+            dP_smoothed = cp.asnumpy(dP_gpu)
+            del dP_gpu
+        finally:
+            cp.get_default_memory_pool().free_all_blocks()
+    else:
+        # CPU fallback
+        dP_smoothed = np.empty_like(dP)
+        for c in range(dP.shape[0]):
+            dP_smoothed[c] = gaussian_filter(dP[c], sigma=sigma)
+
+    return dP_smoothed
+
+
+def _compute_variance_weights(data, alpha=0.5, window_size=3, use_gpu=True):
+    """Compute inverse-variance weights for fusion (u-Segment3D).
+
+    Higher weight is given to regions with low local variance (smooth/confident predictions).
+    This automatically downweights noisy predictions from orthogonal planes.
+
+    Args:
+        data: Array of shape [Z, Y, X] (single channel).
+        alpha: Stabilization constant. Small = aggressive (trust smoothest).
+               Recommended: 1e-5 for cellprob, 0.5 for flows.
+        window_size: Local neighborhood for variance computation.
+        use_gpu: Use CuPy if available.
+
+    Returns:
+        weights: Array of same shape, inverse-variance weights.
+    """
+    if use_gpu and CUPY_ENABLED and torch.cuda.is_available():
+        try:
+            data_gpu = cp.asarray(data)
+            mean_data = uniform_filter_gpu(data_gpu, size=window_size)
+            sq_mean = uniform_filter_gpu(data_gpu ** 2, size=window_size)
+            variance = cp.maximum(sq_mean - mean_data ** 2, 0)
+            sigma = cp.sqrt(variance)
+            weights = 1.0 / (sigma + alpha)
+            weights_np = cp.asnumpy(weights)
+            del data_gpu, mean_data, sq_mean, variance, sigma, weights
+        finally:
+            cp.get_default_memory_pool().free_all_blocks()
+        return weights_np
+    else:
+        mean_data = uniform_filter(data, size=window_size)
+        sq_mean = uniform_filter(data ** 2, size=window_size)
+        variance = np.maximum(sq_mean - mean_data ** 2, 0)
+        sigma = np.sqrt(variance)
+        return 1.0 / (sigma + alpha)
 
 
 def use_gpu(gpu_number=0, use_torch=True):
@@ -298,7 +411,8 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
 def run_3D(net, imgs, batch_size=8, augment=False,
            tile_overlap=0.1, bsize=224, net_ortho=None,
            progress=None, plane_weights=None,
-           return_raw=False):
+           return_raw=False, flow2D_smooth=0.0,
+           use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5):
     """
     Run network on image z-stack.
 
@@ -315,6 +429,14 @@ def run_3D(net, imgs, batch_size=8, augment=False,
         net_ortho (class, optional): cellpose network for orthogonal ZY and ZX planes. Defaults to None.
         progress (QProgressBar, optional): pyqt progress bar. Defaults to None.
         return_raw (bool, optional): If True, return raw per-axis outputs before aggregation. Defaults to False.
+        flow2D_smooth (float, optional): Gaussian sigma for pre-smoothing 2D flows before 3D aggregation
+            (u-Segment3D recommends 1.0). Defaults to 0.0 (no smoothing).
+        use_variance_fusion (bool, optional): Use inverse-variance weighted fusion (u-Segment3D).
+            Automatically downweights noisy planes. Defaults to False.
+        variance_alpha_flow (float, optional): Alpha for flow variance weighting. Larger = more averaging.
+            Defaults to 0.5 (conservative).
+        variance_alpha_cellprob (float, optional): Alpha for cellprob variance weighting.
+            Defaults to 1e-5 (aggressive, strongly trust smooth predictions).
 
     Returns:
         If `return_raw` is True:
@@ -322,6 +444,7 @@ def run_3D(net, imgs, batch_size=8, augment=False,
                 - "y": np.ndarray of shape [num_slices, H, W, 3] (2D flows + cellprob)
                 - "style": np.ndarray style vector
     """
+    print(f"[run_3D] ENTERING run_3D with shape={imgs.shape}")
     sstr = ["YX", "ZY", "ZX"]
     orient_keys = ["xy", "xz", "yz"]  # match user-facing plane names
     pm = [(0, 1, 2, 3), (1, 0, 2, 3), (2, 0, 1, 3)]
@@ -340,8 +463,17 @@ def run_3D(net, imgs, batch_size=8, augment=False,
             raise ValueError("plane_weights entries must be non-negative.")
         if np.all(weights == 0):
             raise ValueError("At least one plane weight must be positive.")
-    flow_weight_totals = np.zeros(3, dtype=np.float32)
-    cellprob_weight_total = 0.0
+    # Initialize weight accumulators - arrays when using variance fusion, scalars otherwise
+    print(f"[run_3D] use_variance_fusion={use_variance_fusion}, alpha_flow={variance_alpha_flow}, alpha_cellprob={variance_alpha_cellprob}")
+    core_logger.info(f"run_3D: use_variance_fusion={use_variance_fusion}")
+    if use_variance_fusion:
+        flow_weight_totals = [np.zeros(shape, dtype=np.float32) for _ in range(3)]
+        cellprob_weight_total = np.zeros(shape, dtype=np.float32)
+        core_logger.info(f"Using variance-weighted fusion: alpha_flow={variance_alpha_flow}, alpha_cellprob={variance_alpha_cellprob}")
+    else:
+        flow_weight_totals = np.zeros(3, dtype=np.float32)
+        cellprob_weight_total = 0.0
+
     raw_outputs = {} if return_raw else None
     for p in range(3):
         weight = float(weights[p])
@@ -354,15 +486,40 @@ def run_3D(net, imgs, batch_size=8, augment=False,
                            xsl, batch_size=batch_size, augment=augment,
                            bsize=bsize, tile_overlap=tile_overlap,
                            rsz=None)
+
+        # Apply 2D pre-smoothing before aggregation (u-Segment3D)
+        if flow2D_smooth > 0:
+            y = _smooth_flows_2d(y, sigma=flow2D_smooth, use_gpu=True)
+
         if return_raw:
             raw_outputs[orient_keys[p]] = {"y": y.copy(), "style": style.copy()}
 
-        yf[..., -1] += weight * y[..., -1].transpose(ipm[p])
-        cellprob_weight_total += weight
-        for j in range(2):
-            axis_idx = cp[p][j]
-            yf[..., axis_idx] += weight * y[..., cpy[p][j]].transpose(ipm[p])
-            flow_weight_totals[axis_idx] += weight
+        if use_variance_fusion:
+            # Variance-weighted fusion: weight by inverse local variance
+            # Transpose cellprob to 3D volume space
+            cellprob_3d = y[..., -1].transpose(ipm[p])
+            w_cellprob = _compute_variance_weights(
+                cellprob_3d, alpha=variance_alpha_cellprob, use_gpu=True)
+            yf[..., -1] += weight * w_cellprob * cellprob_3d
+            cellprob_weight_total += weight * w_cellprob
+
+            # Variance weights for each flow component
+            for j in range(2):
+                axis_idx = cp[p][j]
+                flow_3d = y[..., cpy[p][j]].transpose(ipm[p])
+                w_flow = _compute_variance_weights(
+                    flow_3d, alpha=variance_alpha_flow, use_gpu=True)
+                yf[..., axis_idx] += weight * w_flow * flow_3d
+                flow_weight_totals[axis_idx] += weight * w_flow
+        else:
+            # Original simple weighted accumulation
+            yf[..., -1] += weight * y[..., -1].transpose(ipm[p])
+            cellprob_weight_total += weight
+            for j in range(2):
+                axis_idx = cp[p][j]
+                yf[..., axis_idx] += weight * y[..., cpy[p][j]].transpose(ipm[p])
+                flow_weight_totals[axis_idx] += weight
+
         y = None; del y
 
         if progress is not None:
@@ -371,10 +528,27 @@ def run_3D(net, imgs, batch_size=8, augment=False,
     if return_raw:
         return raw_outputs
 
+    # Normalize by accumulated weights
+    if use_variance_fusion:
+        # Per-voxel normalization for variance-weighted fusion
+        for axis_idx in range(3):
+            mask = flow_weight_totals[axis_idx] > 0
+            yf[..., axis_idx][mask] /= flow_weight_totals[axis_idx][mask]
+        mask = cellprob_weight_total > 0
+        yf[..., -1][mask] /= cellprob_weight_total[mask]
+    else:
+        # Scalar normalization for simple weighted average
+        for axis_idx in range(3):
+            if flow_weight_totals[axis_idx] > 0:
+                yf[..., axis_idx] /= flow_weight_totals[axis_idx]
+        if cellprob_weight_total > 0:
+            yf[..., -1] /= cellprob_weight_total
+
+    # Diagnostic: flow statistics per axis (Z, Y, X)
+    axis_names = ['Z', 'Y', 'X']
     for axis_idx in range(3):
-        if flow_weight_totals[axis_idx] > 0:
-            yf[..., axis_idx] /= flow_weight_totals[axis_idx]
-    if cellprob_weight_total > 0:
-        yf[..., -1] /= cellprob_weight_total
+        flow = yf[..., axis_idx]
+        print(f"[run_3D] {axis_names[axis_idx]}-flow: mean={flow.mean():.4f}, std={flow.std():.4f}, "
+              f"min={flow.min():.4f}, max={flow.max():.4f}")
 
     return yf, style
