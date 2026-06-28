@@ -24,7 +24,7 @@ from . import guiparts, menus, io
 from .. import models, core, dynamics, version
 from ..utils import download_url_to_file, masks_to_outlines, diameters
 from ..io import get_image_files, imsave, imread
-from ..transforms import resize_image, normalize99  #fixed import
+from ..transforms import resize_image, normalize99, convert_image  #fixed import
 from ..plot import disk
 from ..transforms import normalize99_tile, smooth_sharpen_img
 from .gui import MainW
@@ -248,7 +248,7 @@ class MainW_ortho2D(MainW):
 
         # 1. Load the main 2D image using the standard io function
         # Set load_3D=False explicitly for the base loader
-        original_load_3d_flag = self.load_3D
+        original_load_3d_flag = self.__dict__.get("load_3D", False)
         try:
             # Temporarily force 2D load; guiortho manages its own ortho stack.
             self.load_3D = False
@@ -276,14 +276,17 @@ class MainW_ortho2D(MainW):
              return
 
         print(f"GUI_INFO: Loaded main 2D image: {self.filename}")
-        print(f"GUI_INFO: Main stack shape: {self.stack.shape}, NZ={self.ortho_nz}, nchan={self.nchan}") # Should be NZ=1
+        print(
+            f"GUI_INFO: Main stack shape: {self.stack.shape}, "
+            f"NZ={self.__dict__.get('ortho_nz', 0)}, nchan={self.nchan}"
+        ) # Should be NZ=1
 
         # 2. Find and load the Z-stack based on filename pattern (only when ortho is enabled)
         self.stack_ortho = None
         self.ortho_nz = 0
         self.zc_ortho = 0
         self._ortho_seg_warned = False
-        if getattr(self, "_auto_enable_ortho", False) and not self.orthobtn.isChecked():
+        if self.__dict__.get("_auto_enable_ortho", False) and not self.orthobtn.isChecked():
             try:
                 blocker = getattr(self.orthobtn, "blockSignals", None)
                 if callable(blocker):
@@ -329,31 +332,41 @@ class MainW_ortho2D(MainW):
 
             # Try to find Z index using supported patterns:
             #   underscore: basename_z<idx>.<ext>
-            #   dash:       basename-<idx>.<ext>
             #   double-dash underscore: family--<id>_z<idx>.<ext>
+            #   generic: any file ending with 3-6 digits (captures last 3-6 digit sequence)
             m_z = re.match(r'^(.*)_z(\d+)$', basename)
-            m_dash = re.match(r'^(.*)-(\d+)$', basename)
             # allow arbitrary id between the double dashes before _z##
             m_ddash = re.match(r'^(.*)--(.+)_z(\d+)$', basename)
-            if m_z or m_dash or m_ddash:
+            # dash-number pattern: basename-<idx>
+            m_dash = re.match(r'^(.*-)(\d+)$', basename)
+            # generic pattern: match any filename ending with 3-6 digits
+            m_generic = re.match(r'^(.*\D)(\d{3,6})$', basename)
+            if m_z or m_ddash or m_dash or m_generic:
                 if m_z:
                     family = m_z.group(1)
                     main_z_index = int(m_z.group(2))
                     glob_glob = f"{family}_z*{ext}"
                     stem_regex = re.compile(rf'^{re.escape(family)}_z(\d+)$')
                     pattern_tag = "underscore"
-                elif m_dash:
-                    family = m_dash.group(1)
-                    main_z_index = int(m_dash.group(2))
-                    glob_glob = f"{family}-*{ext}"
-                    stem_regex = re.compile(rf'^{re.escape(family)}-(\d+)$')
-                    pattern_tag = "dash"
-                else:
+                elif m_ddash:
                     family = m_ddash.group(1) + "--" + m_ddash.group(2)
                     main_z_index = int(m_ddash.group(3))
                     glob_glob = f"{family}_z*{ext}"
                     stem_regex = re.compile(rf'^{re.escape(family)}_z(\d+)$')
                     pattern_tag = "ddash_z"
+                elif m_dash:
+                    family = m_dash.group(1)
+                    main_z_index = int(m_dash.group(2))
+                    glob_glob = f"{family}*{ext}"
+                    stem_regex = re.compile(rf'^{re.escape(family)}(\d+)$')
+                    pattern_tag = "dash"
+                else:
+                    # generic: last 3-6 digits are Z-index
+                    family = m_generic.group(1)
+                    main_z_index = int(m_generic.group(2))
+                    glob_glob = f"{family}*{ext}"
+                    stem_regex = re.compile(rf'^{re.escape(family)}(\d{{3,6}})$')
+                    pattern_tag = "generic"
                 glob_pattern = str(folder / glob_glob)
                 print(f"GUI_INFO: Globbing for Z-stack: {glob_pattern}")
 
@@ -401,11 +414,7 @@ class MainW_ortho2D(MainW):
                         cached = self._ortho_cache.get(z_idx)
                         if cached is None:
                             try:
-                                img = imread(f)
-                                if img.ndim == 2:
-                                    img = img[:, :, np.newaxis]
-                                if img.shape[0] < 4 or img.shape[1] < 4:
-                                    img = np.transpose(img, (1, 2, 0))
+                                img = convert_image(imread(f), do_3D=False)
                                 current_shape_2d = img.shape[:2]
                                 if self._ortho_cache_shape is None:
                                     self._ortho_cache_shape = current_shape_2d
@@ -415,10 +424,6 @@ class MainW_ortho2D(MainW):
                                         f"({current_shape_2d} vs {self._ortho_cache_shape})"
                                     )
                                     continue
-                                if self.nchan > 1 and img.shape[-1] == 1:
-                                    img = np.repeat(img, 3, axis=-1)
-                                elif img.shape[-1] > 3:
-                                    img = img[..., :3]
                                 img = img.astype(np.float32, copy=False)
                                 self._ortho_cache[z_idx] = img
                                 self._ortho_cache.move_to_end(z_idx)
@@ -453,13 +458,15 @@ class MainW_ortho2D(MainW):
                         self.zc_ortho = 0
                     else:
                         self.stack_ortho = np.stack(images, axis=0)  # (NZ, Ly, Lx, C)
-                        img_min = self.stack_ortho.min()
-                        img_max = self.stack_ortho.max()
+                        # Use main image's normalization params so saturation matches
+                        img_min = self.__dict__.get('_stack_norm_min', self.stack_ortho.min())
+                        img_max = self.__dict__.get('_stack_norm_max', self.stack_ortho.max())
                         self.stack_ortho = self.stack_ortho.astype(np.float32)
                         self.stack_ortho -= img_min
                         if img_max > img_min + 1e-3:
                             self.stack_ortho /= (img_max - img_min)
                         self.stack_ortho *= 255
+                        np.clip(self.stack_ortho, 0, 255, out=self.stack_ortho)
                         self.ortho_nz = self.stack_ortho.shape[0]
                         # Normalize to absolute posix-like strings to avoid separator/case mismatches on lookup
                         self.ortho_files_sorted = [Path(f).resolve().as_posix() for f in used_files]
@@ -596,6 +603,7 @@ class MainW_ortho2D(MainW):
         self.vLineOrtho[0].setPos(self.zc)
         self.hLineOrtho[0].setPos(self.yortho)
         self._diff_update_crosshair_lines((self.yortho, self.xortho), reason="ortho")
+        self._gradxy_update_crosshair_lines((self.yortho, self.xortho), reason="ortho")
         self._update_ortho_anchor_display()
 
     def get_crosshair_coords(self):
@@ -643,11 +651,11 @@ class MainW_ortho2D(MainW):
         x = self.xortho
         z_center = min(max(self.zc_ortho, 0), max(self.ortho_nz - 1, 0))
         zrange = max(1, 2 * self.dz)
-        center_mode = not getattr(self, "_preserve_window", False)
+        center_mode = not self.__dict__.get("_preserve_window", False)
 
         # Previous window start and a potential local click index
-        prev_start = getattr(self, "_zi_start", None)
-        click_k = getattr(self, "_next_z_click_local_k", None)
+        prev_start = self.__dict__.get("_zi_start", None)
+        click_k = self.__dict__.get("_next_z_click_local_k", None)
 
         if center_mode or prev_start is None:
             zi_start = z_center - self.dz
@@ -783,16 +791,16 @@ class MainW_ortho2D(MainW):
             np.zeros((zrange, self.Lx, 4), "uint8")
         ]
 
-        cellpix = getattr(self, "cellpix", None)
-        outpix = getattr(self, "outpix", None)
+        cellpix = self.__dict__.get("cellpix", None)
+        outpix = self.__dict__.get("outpix", None)
         masks_available = (
-            getattr(self, "masksOn", False)
+            self.__dict__.get("masksOn", False)
             and isinstance(cellpix, np.ndarray)
             and cellpix.ndim == 3
             and cellpix.size > 0
         )
         outlines_available = (
-            getattr(self, "outlinesOn", False)
+            self.__dict__.get("outlinesOn", False)
             and isinstance(outpix, np.ndarray)
             and outpix.ndim == 3
             and outpix.size > 0

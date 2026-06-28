@@ -556,6 +556,12 @@ class MainW(QMainWindow):
         self.maskToggleButton.clicked.connect(self.toggle_mask_restore)
         self.segBoxG.addWidget(self.maskToggleButton, widget_row, 3, 1, 3)
 
+        self.gradxyButton = QPushButton("gradXY")
+        self.gradxyButton.setFont(self.medfont)
+        self.gradxyButton.setEnabled(False)
+        self.gradxyButton.clicked.connect(self.show_gradxy_view)
+        self.segBoxG.addWidget(self.gradxyButton, widget_row, 6, 1, 3)
+
         self._diff_state_cache = DiffStateCache()
         self._diff_fig = None
         self._diff_ax = None
@@ -582,6 +588,17 @@ class MainW(QMainWindow):
         self._diff_crosshair_suppress_broadcast = False
         self._diff_crosshair_hub = DiffCrosshairHub.instance()
         self._diff_crosshair_hub.register(self)
+
+        # GradXY viewer state
+        self._gradxy_fig = None
+        self._gradxy_ax = None
+        self._gradxy_img_im = None
+        self._gradxy_click_cid = None
+        self._gradxy_scroll_cid = None
+        self._gradxy_crosshair_lines = None
+        self._gradxy_last_shape = None
+        self._gradxy_z_index = None
+        self._gradxy_crosshair_suppress_broadcast = False
 
         widget_row += 1
 
@@ -632,6 +649,11 @@ class MainW(QMainWindow):
         self.modelBoxG.addWidget(self.ModelButtonC, widget_row, 8, 1, 1)
         self.ModelButtonC.setEnabled(False)
 
+        # model modified time label
+        self.ModelModifiedLabel = QLabel("")
+        self.ModelModifiedLabel.setFont(self.smallfont)
+        self.ModelModifiedLabel.setFixedHeight(14)
+        self.modelBoxG.addWidget(self.ModelModifiedLabel, widget_row + 1, 0, 1, 9)
 
         b += 1
         self.filterBox = QGroupBox("Image filtering")
@@ -975,6 +997,19 @@ class MainW(QMainWindow):
                 base_tip = "Show saved _seg.npy segmentation"
             self.maskToggleButton.setToolTip(base_tip if can_reset else reset_tip)
 
+        if hasattr(self, "gradxyButton"):
+            has_flows = (hasattr(self, "flows") and
+                        len(self.flows) > 0 and
+                        len(self.flows[0]) > 0)
+            self.gradxyButton.setEnabled(has_flows)
+            if has_flows:
+                gradxy_tip = "Open gradXY flow visualization in a new window."
+                if not MATPLOTLIB:
+                    gradxy_tip += " (Matplotlib required)"
+            else:
+                gradxy_tip = "Run a segmentation model to view gradXY flows."
+            self.gradxyButton.setToolTip(gradxy_tip)
+
     def _diff_cache_key(self, filename=None):
         path = filename if filename is not None else getattr(self, "filename", None)
         if isinstance(path, str) and path:
@@ -998,6 +1033,14 @@ class MainW(QMainWindow):
             return
         latest_masks = self._diff_latest_masks if isinstance(self._diff_latest_masks, np.ndarray) else None
         active_state = state_new if not self._diff_showing_restored else self._diff_get_saved_state(reload=False)
+        # Preserve flows - needed for gradXY viewer and _seg.npy
+        flows = getattr(self, "flows", None)
+        flows_copy = None
+        if flows is not None and isinstance(flows, list) and len(flows) > 0:
+            try:
+                flows_copy = [np.array(f, copy=True) if isinstance(f, np.ndarray) else f for f in flows]
+            except Exception:
+                flows_copy = None
         cache.store(
             key,
             new_state=state_new,
@@ -1007,6 +1050,7 @@ class MainW(QMainWindow):
             crosshair=self._diff_last_crosshair,
             z_index=self._diff_z_index,
             last_shape=self._diff_last_shape,
+            flows=flows_copy,
         )
 
     def _diff_restore_after_image_load(self):
@@ -1017,6 +1061,11 @@ class MainW(QMainWindow):
         key = self._diff_cache_key()
         entry = cache.retrieve(key)
         if not entry:
+            # No cache entry, but still restore crosshair from hub for global sync
+            hub_coords = self._diff_crosshair_hub.current() if hasattr(self, "_diff_crosshair_hub") else None
+            if hub_coords is not None:
+                self._diff_last_crosshair = tuple(hub_coords)
+                self._diff_update_crosshair_lines(self._diff_last_crosshair, reason="restore-from-hub")
             self._diff_update_button_state()
             return
         showing_restored = bool(entry.get("showing_restored", False))
@@ -1026,6 +1075,7 @@ class MainW(QMainWindow):
         crosshair = entry.get("crosshair")
         z_index = entry.get("z_index")
         last_shape = entry.get("last_shape")
+        flows = entry.get("flows")
         try:
             if showing_restored:
                 if active_state is not None:
@@ -1050,7 +1100,20 @@ class MainW(QMainWindow):
                     self._diff_state_new = None
                     self._diff_latest_masks = None
             self._diff_showing_restored = showing_restored
-            self._diff_last_crosshair = tuple(crosshair) if crosshair is not None else None
+            # Restore flows if cached
+            if flows is not None and isinstance(flows, list) and len(flows) > 0:
+                try:
+                    self.flows = [np.array(f, copy=True) if isinstance(f, np.ndarray) else f for f in flows]
+                except Exception:
+                    pass  # Keep current flows if restore fails
+            # Prefer hub coords for global crosshair synchronization, fall back to cache
+            hub_coords = self._diff_crosshair_hub.current() if hasattr(self, "_diff_crosshair_hub") else None
+            if hub_coords is not None:
+                self._diff_last_crosshair = tuple(hub_coords)
+            elif crosshair is not None:
+                self._diff_last_crosshair = tuple(crosshair)
+            else:
+                self._diff_last_crosshair = None
 
             # Clamp cached crosshair to the freshly loaded image size so the
             # Matplotlib diff cursor stays aligned when tiles have different dims.
@@ -1192,6 +1255,14 @@ class MainW(QMainWindow):
             self._diff_crosshair_hub.set_coords(
                 (y, x), source=self, reason=reason or "local"
             )
+        # Also update gradXY viewer directly (hub skips source, so we must do it here)
+        if not getattr(self, "_gradxy_crosshair_suppress_broadcast", False):
+            prev_gradxy = self._gradxy_crosshair_suppress_broadcast
+            self._gradxy_crosshair_suppress_broadcast = True
+            try:
+                self._gradxy_update_crosshair_lines((y, x), reason=reason or "local")
+            finally:
+                self._gradxy_crosshair_suppress_broadcast = prev_gradxy
 
     def diff_crosshair_updated(self, coords, *, source=None, reason=None):
         if coords is None:
@@ -1201,6 +1272,7 @@ class MainW(QMainWindow):
         except (TypeError, ValueError):
             return
         self._diff_last_crosshair = (float(y), float(x))
+        # Update diff viewer
         prev = self._diff_crosshair_suppress_broadcast
         self._diff_crosshair_suppress_broadcast = True
         try:
@@ -1209,6 +1281,15 @@ class MainW(QMainWindow):
             )
         finally:
             self._diff_crosshair_suppress_broadcast = prev
+        # Update gradXY viewer
+        prev_gradxy = self._gradxy_crosshair_suppress_broadcast
+        self._gradxy_crosshair_suppress_broadcast = True
+        try:
+            self._gradxy_update_crosshair_lines(
+                self._diff_last_crosshair, reason=reason or "hub"
+            )
+        finally:
+            self._gradxy_crosshair_suppress_broadcast = prev_gradxy
 
     def _diff_can_reset(self) -> tuple[bool, str]:
         state_old = self._diff_get_saved_state(reload=False)
@@ -1856,6 +1937,228 @@ class MainW(QMainWindow):
         plt.show(block=False)
         self._diff_log("diff viewer open: click magenta to accept saved label, green to accept model label")
 
+    # ==================== GradXY Viewer Methods ====================
+
+    def _gradxy_reset_state(self):
+        self._gradxy_fig = None
+        self._gradxy_ax = None
+        self._gradxy_img_im = None
+        self._gradxy_click_cid = None
+        self._gradxy_scroll_cid = None
+        self._gradxy_crosshair_lines = None
+        self._gradxy_last_shape = None
+        self._gradxy_z_index = None
+        self._gradxy_crosshair_suppress_broadcast = False
+
+    def _gradxy_disconnect_handlers(self, canvas):
+        if canvas is None:
+            return
+        if self._gradxy_click_cid is not None:
+            try:
+                canvas.mpl_disconnect(self._gradxy_click_cid)
+            except Exception:
+                pass
+        if self._gradxy_scroll_cid is not None:
+            try:
+                canvas.mpl_disconnect(self._gradxy_scroll_cid)
+            except Exception:
+                pass
+
+    def _gradxy_close_existing(self):
+        fig = getattr(self, "_gradxy_fig", None)
+        if fig is None:
+            return
+        canvas = getattr(fig, "canvas", None)
+        if canvas is not None:
+            self._gradxy_disconnect_handlers(canvas)
+        try:
+            plt.close(fig)
+        except Exception as exc:
+            print(f"GUI_WARNING: failed to close existing gradxy viewer: {exc}")
+        self._gradxy_reset_state()
+
+    def _gradxy_on_close(self, event):
+        if getattr(event, "canvas", None) is None:
+            return
+        if getattr(event.canvas, "figure", None) is not getattr(self, "_gradxy_fig", None):
+            return
+        self._gradxy_disconnect_handlers(event.canvas)
+        self._gradxy_reset_state()
+
+    def _gradxy_update_crosshair_lines(self, coords=None, *, reason=None):
+        if not MATPLOTLIB:
+            return
+        fig = getattr(self, "_gradxy_fig", None)
+        ax = getattr(self, "_gradxy_ax", None)
+        if fig is None or ax is None:
+            return
+        if not plt.fignum_exists(fig.number):
+            self._gradxy_reset_state()
+            return
+        if coords is None:
+            coords = self.get_crosshair_coords()
+        if coords is None:
+            return
+        y, x = map(float, coords)
+        if self._gradxy_last_shape:
+            h, w = self._gradxy_last_shape
+            if h > 0 and w > 0:
+                y = float(np.clip(y, 0, h - 1))
+                x = float(np.clip(x, 0, w - 1))
+        if self._gradxy_crosshair_lines is None:
+            line_kwargs = {"color": "cyan", "linewidth": 0.8, "alpha": 0.7, "linestyle": "--"}
+            hline = ax.axhline(y, **line_kwargs)
+            vline = ax.axvline(x, **line_kwargs)
+            self._gradxy_crosshair_lines = (hline, vline)
+        else:
+            hline, vline = self._gradxy_crosshair_lines
+            hline.set_ydata([y, y])
+            vline.set_xdata([x, x])
+        fig.canvas.draw_idle()
+        if (
+            hasattr(self, "_diff_crosshair_hub")
+            and self._diff_crosshair_hub is not None
+            and not getattr(self, "_gradxy_crosshair_suppress_broadcast", False)
+        ):
+            self._diff_crosshair_hub.set_coords(
+                (y, x), source=self, reason=reason or "gradxy"
+            )
+        # Also update diff viewer directly (hub skips source, so we must do it here)
+        if not getattr(self, "_diff_crosshair_suppress_broadcast", False):
+            prev_diff = self._diff_crosshair_suppress_broadcast
+            self._diff_crosshair_suppress_broadcast = True
+            try:
+                self._diff_last_crosshair = (y, x)
+                self._diff_update_crosshair_lines((y, x), reason=reason or "gradxy")
+            finally:
+                self._diff_crosshair_suppress_broadcast = prev_diff
+
+    def _on_gradxy_click(self, event):
+        if event is None or event.inaxes is not self._gradxy_ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        y, x = float(event.ydata), float(event.xdata)
+        if self._gradxy_last_shape:
+            h, w = self._gradxy_last_shape
+            y = float(np.clip(y, 0, h - 1))
+            x = float(np.clip(x, 0, w - 1))
+        self._gradxy_update_crosshair_lines((y, x), reason="click")
+
+    def _on_gradxy_scroll(self, event):
+        if event is None or event.inaxes is not self._gradxy_ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        shape = self._gradxy_last_shape
+        if shape is None:
+            return
+        h, w = shape
+        x_min, x_max = -0.5, w - 0.5
+        y_min, y_max = -0.5, h - 0.5
+        ax = self._gradxy_ax
+        current_xlim = ax.get_xlim()
+        current_ylim = ax.get_ylim()
+        span_x = abs(current_xlim[1] - current_xlim[0])
+        span_y = abs(current_ylim[1] - current_ylim[0])
+        if span_x <= 0 or span_y <= 0:
+            return
+
+        step = getattr(event, "step", 0)
+        if step == 0:
+            step = 1 if getattr(event, "button", "up") == "up" else -1
+        zoom_in = step > 0
+        scale = 0.8 if zoom_in else 1.25
+        min_span = 5.0
+
+        def compute_limits(current_range, center, full_min, full_max):
+            orientation = 1 if current_range[1] >= current_range[0] else -1
+            span = abs(current_range[1] - current_range[0])
+            new_span = span * scale
+            new_span = max(min_span, min(new_span, full_max - full_min))
+            half = new_span / 2.0
+            if orientation == 1:
+                lo = center - half
+                hi = center + half
+            else:
+                lo = center + half
+                hi = center - half
+            low = min(lo, hi)
+            high = max(lo, hi)
+            if low < full_min:
+                delta = full_min - low
+                lo += delta
+                hi += delta
+            if high > full_max:
+                delta = high - full_max
+                lo -= delta
+                hi -= delta
+            return lo, hi
+
+        new_xlim = compute_limits(current_xlim, float(event.xdata), x_min, x_max)
+        new_ylim = compute_limits(current_ylim, float(event.ydata), y_min, y_max)
+        ax.set_xlim(*new_xlim)
+        ax.set_ylim(*new_ylim)
+        self._gradxy_update_crosshair_lines()
+        ax.figure.canvas.draw_idle()
+
+    def show_gradxy_view(self):
+        if not MATPLOTLIB:
+            QMessageBox.warning(self, "GradXY viewer unavailable",
+                                "Install matplotlib to view gradXY flows.")
+            return
+        if not hasattr(self, "flows") or len(self.flows) == 0 or len(self.flows[0]) == 0:
+            QMessageBox.information(self, "No flow data",
+                                    "Run a segmentation model before viewing gradXY flows.")
+            return
+        z_index = int(np.clip(self.currentZ, 0, len(self.flows[0]) - 1))
+        gradxy_rgb = self.flows[0][z_index]
+        if gradxy_rgb is None or gradxy_rgb.size == 0:
+            QMessageBox.warning(self, "Empty flow data",
+                                "GradXY flow data is empty for this Z-plane.")
+            return
+
+        self._gradxy_close_existing()
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        height, width = gradxy_rgb.shape[:2]
+        im = ax.imshow(
+            gradxy_rgb,
+            interpolation="nearest",
+            origin="upper",
+            extent=(-0.5, width - 0.5, height - 0.5, -0.5),
+        )
+        ax.axis("off")
+        ax.set_xlim(-0.5, width - 0.5)
+        ax.set_ylim(height - 0.5, -0.5)
+        try:
+            fig.canvas.manager.set_window_title(f"Cellpose gradXY flows (Z={z_index})")
+        except Exception:
+            pass
+        fig.tight_layout()
+        self._gradxy_fig = fig
+        self._gradxy_ax = ax
+        self._gradxy_img_im = im
+        self._gradxy_z_index = z_index
+        self._gradxy_crosshair_lines = None
+        self._gradxy_last_shape = gradxy_rgb.shape[:2]
+        if hasattr(fig.canvas, "mpl_connect"):
+            fig.canvas.mpl_connect("close_event", self._gradxy_on_close)
+            self._gradxy_click_cid = fig.canvas.mpl_connect("button_press_event", self._on_gradxy_click)
+            self._gradxy_scroll_cid = fig.canvas.mpl_connect("scroll_event", self._on_gradxy_scroll)
+        hub_coords = self._diff_crosshair_hub.current()
+        if hub_coords is not None:
+            prev = self._gradxy_crosshair_suppress_broadcast
+            self._gradxy_crosshair_suppress_broadcast = True
+            try:
+                self._gradxy_update_crosshair_lines(hub_coords, reason="viewer-open")
+            finally:
+                self._gradxy_crosshair_suppress_broadcast = prev
+        else:
+            self._gradxy_update_crosshair_lines(reason="viewer-open")
+        fig.show()
+        plt.show(block=False)
+
     def toggle_mask_restore(self):
         can_reset, reason = self._diff_can_reset()
         if not can_reset:
@@ -2373,31 +2676,22 @@ class MainW(QMainWindow):
         self.filename = []
         self.loaded = False
         self.recompute_masks = False
+        # Reset per-image diff data (but NOT the matplotlib window references)
         self._diff_seg_path = None
         self._diff_latest_masks = None
         self._diff_state_old = None
         self._diff_state_new = None
-        self._diff_fig = None
-        self._diff_ax = None
-        self._diff_img_im = None
-        self._diff_diff_rgb = None
-        self._diff_click_cid = None
-        self._diff_scroll_cid = None
-        self._diff_z_index = None
-        self._diff_crosshair_lines = None
-        self._diff_last_shape = None
-        self._diff_last_crosshair = None
-        self._diff_drag_active = False
-        self._diff_drag_last_update = 0.0
         self._diff_showing_restored = False
         self._diff_state_old_manual_override = False
-        self._diff_crosshair_suppress_broadcast = False
-        self._diff_clear_overlay_reference()
+        # NOTE: Do NOT clear _diff_fig, _diff_ax, _diff_crosshair_lines, etc.
+        # The diff viewer window should persist when switching images.
         if hasattr(self, "diffButton"):
             self.diffButton.setEnabled(False)
         if hasattr(self, "maskToggleButton"):
             self.maskToggleButton.setEnabled(False)
             self.maskToggleButton.setText("reset mask")
+        if hasattr(self, "gradxyButton"):
+            self.gradxyButton.setEnabled(False)
 
         self.deleting_multiple = False
         self.removing_cells_list = []
@@ -2453,7 +2747,9 @@ class MainW(QMainWindow):
         self.update_scale()
         self.update_layer()
         self._refresh_anchor_views()
-        self._diff_note_manual_edit()
+        # NOTE: Do NOT call _diff_note_manual_edit() here - clear_all() is called
+        # during reset/image load, and noting it as a "manual edit" would overwrite
+        # the cached diff state with empty masks before restore can happen.
 
     def select_cell(self, idx):
         self.prev_selected = self.selected
@@ -2773,6 +3069,9 @@ class MainW(QMainWindow):
                             coords = (float(y), float(x))
                             self._diff_last_crosshair = coords
                             self._diff_update_crosshair_lines(
+                                coords, reason="mouse-drag"
+                            )
+                            self._gradxy_update_crosshair_lines(
                                 coords, reason="mouse-drag"
                             )
                 self._diff_drag_last_update = now
@@ -3230,6 +3529,14 @@ class MainW(QMainWindow):
             self.model = models.CellposeModel(gpu=self.useGPU.isChecked(),
                                              pretrained_model=self.current_model)
 
+        # Update model modified time label
+        if os.path.exists(self.current_model_path):
+            mtime = os.path.getmtime(self.current_model_path)
+            mtime_str = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            self.ModelModifiedLabel.setText(f"modified: {mtime_str}")
+        else:
+            self.ModelModifiedLabel.setText("")
+
     def add_model(self):
         io._add_model(self)
         return
@@ -3319,7 +3626,7 @@ class MainW(QMainWindow):
                 self.logger.error("Flows don't exist, try running model again.")
                 return
 
-            maski = dynamics.compute_masks_and_clean(
+            maski = dynamics.compute_masks(
                 dP=dP,
                 cellprob=cellprob,
                 niter=niter,

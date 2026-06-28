@@ -28,6 +28,15 @@ def _clone_array(value: np.ndarray | None) -> np.ndarray | None:
     return np.array(value, copy=True)
 
 
+def _clone_flows(flows: list | None) -> list | None:
+    if flows is None:
+        return None
+    try:
+        return [np.array(f, copy=True) if isinstance(f, np.ndarray) else copy.deepcopy(f) for f in flows]
+    except Exception:
+        return None
+
+
 def _clone_entry(entry: CacheEntry | None) -> CacheEntry | None:
     if entry is None:
         return None
@@ -39,6 +48,7 @@ def _clone_entry(entry: CacheEntry | None) -> CacheEntry | None:
         "crosshair": tuple(entry["crosshair"]) if entry.get("crosshair") is not None else None,
         "z_index": entry.get("z_index"),
         "last_shape": entry.get("last_shape"),
+        "flows": _clone_flows(entry.get("flows")),
     }
     return cloned
 
@@ -60,6 +70,7 @@ class DiffStateCache:
         crosshair: tuple[float, float] | None = None,
         z_index: int | None = None,
         last_shape: tuple[int, int] | None = None,
+        flows: list | None = None,
     ) -> None:
         if not key:
             return
@@ -75,6 +86,7 @@ class DiffStateCache:
             "crosshair": tuple(crosshair) if crosshair is not None else None,
             "z_index": z_index,
             "last_shape": last_shape,
+            "flows": _clone_flows(flows),
         }
         self._store[key] = entry
 

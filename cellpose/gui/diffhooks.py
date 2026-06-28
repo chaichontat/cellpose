@@ -123,8 +123,3 @@ def note_manual_edit(parent: Any) -> None:
                 pass
 
     _call_if_possible(parent, "_diff_update_button_state")
-    try:
-        _call_if_possible(parent, "_diff_refresh_overlay")
-    except Exception:
-        # Overlay refresh is opportunistic; ignore rendering errors.
-        pass

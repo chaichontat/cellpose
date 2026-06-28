@@ -238,6 +238,9 @@ def _initialize_images(parent, image, load_3D=False, skip_autosat=False):
 
     img_min = image.min()
     img_max = image.max()
+    # Store normalization parameters for ortho view to use
+    parent._stack_norm_min = float(img_min)
+    parent._stack_norm_max = float(img_max)
     parent.stack = parent.stack.astype(np.float32)
     parent.stack -= img_min
     if img_max > img_min + 1e-3:

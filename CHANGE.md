@@ -2,8 +2,7 @@
 - Added diff/mask management enhancements in `cellpose/gui/gui.py`:
   * Introduced `maskToggleButton` alongside the existing diff control to toggle between saved `_seg.npy` masks and the latest model output.
   * Implemented `_diff_state_old` / `_diff_state_new` caching and helper utilities (`_diff_get_saved_state`, `_diff_store_current_as_new`, `_diff_apply_state`, `_diff_can_reset`) to ensure mask toggling works for both 2D and Z-stack data without corrupting state.
-  * Updated `compute_segmentation()` to snapshot the freshly computed masks/outlines, and refactored `show_segmentation_diff()` to reuse the cached saved state.
-  * Diff viewer now keeps a cyan crosshair synchronized with the active XY crosshair (ortho mode exposes `(yortho, xortho)` via `get_crosshair_coords()` and `update_crosshairs`).
+  * Updated `compute_segmentation()` to snapshot the freshly computed masks/outlines, refactored `show_segmentation_diff()` to reuse the cached saved state, and added a cyan crosshair overlay that stays synchronized with the active XY crosshair (hold `Space` and drag to reposition at ~15 fps; ortho mode exposes `(yortho, xortho)` via `get_crosshair_coords()` and `update_crosshairs`).
 - Refined diff visualization colors in `cellpose/contrib/diff.py` so “old” contours render magenta, “new” contours render green, and shared contours appear dim gray.
 - Documented the updated workflow and safeguards in `diff-viewer.md` (diff button prerequisites, mask reset behavior, error handling expectations).
 
