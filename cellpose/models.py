@@ -83,7 +83,7 @@ class CellposeModel():
         __init__(self, gpu=False, pretrained_model=False, model_type=None, diam_mean=30., device=None):
             Initialize the CellposeModel.
 
-        eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None, z_axis=None, normalize=True, invert=False, rescale=None, diameter=None, flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None, stitch_threshold=0.0, min_size=15, niter=None, augment=False, tile_overlap=0.1, bsize=256, interp=True, compute_masks=True, progress=None):
+        eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None, z_axis=None, normalize=True, invert=False, rescale=None, diameter=None, flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None, stitch_threshold=0.0, min_size=15, niter=None, augment=False, tile_overlap=0.1, bsize=256, interp=True, compute_masks=True, progress=None, return_flows=True):
             Segment list of images x, or 4D array - Z x C x Y x X.
 
     """
@@ -198,7 +198,8 @@ class CellposeModel():
              compute_masks=True, progress=None,
              return_raw_3d=False, momentum=0.0, step_decay=0.0,
              use_kde_clustering=False, kde_sigma=1.0, kde_threshold_k=1.0,
-             use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5):
+             use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5,
+             return_flows=True):
         """ segment list of images x, or 4D array - Z x 3 x Y x X
 
         Args:
@@ -240,6 +241,7 @@ class CellposeModel():
             bsize (int, optional): block size for tiles, recommended to keep at 256, like in training. Defaults to 256.
             interp (bool, optional): interpolate during 2D dynamics (not available in 3D) . Defaults to True.
             compute_masks (bool, optional): Whether or not to compute dynamics and return masks. Returns empty array if False. Defaults to True.
+            return_flows (bool, optional): Whether to render and return flow diagnostics. Set to False when only masks are needed. Defaults to True.
             progress (QProgressBar, optional): pyqt progress bar. Defaults to None.
 
         Returns:
@@ -286,6 +288,7 @@ class CellposeModel():
                     flow_threshold=flow_threshold,
                     cellprob_threshold=cellprob_threshold,
                     compute_masks=compute_masks,
+                    return_flows=return_flows,
                     min_size=min_size,
                     max_size_fraction=max_size_fraction,
                     stitch_threshold=stitch_threshold,
@@ -325,9 +328,10 @@ class CellposeModel():
             Lz_0 = x.shape[0]
         if diameter is not None:
             image_scaling = 30. / diameter
-            x = transforms.resize_image(x,
-                                        Ly=int(x.shape[1] * image_scaling),
-                                        Lx=int(x.shape[2] * image_scaling))
+            scaled_y = int(x.shape[1] * image_scaling)
+            scaled_x = int(x.shape[2] * image_scaling)
+            if (scaled_y, scaled_x) != x.shape[1:3]:
+                x = transforms.resize_image(x, Ly=scaled_y, Lx=scaled_x)
 
 
         # normalize image
@@ -410,23 +414,34 @@ class CellposeModel():
 
         # undo resizing:
         if image_scaling is not None or anisotropy is not None:
-
-            dP = self._resize_gradients(dP, to_y_size=Ly_0, to_x_size=Lx_0, to_z_size=Lz_0) # works for 2 or 3D:
-            cellprob = self._resize_cellprob(cellprob, to_x_size=Lx_0, to_y_size=Ly_0, to_z_size=Lz_0)
-
             if do_3D:
-                if compute_masks:
-                    # Rescale xy then xz:
+                if compute_masks and (
+                    return_flows or masks.shape != (Lz_0, Ly_0, Lx_0)
+                ):
+                    # Rescale xy then xz. Mask-only callers skip this when it is an identity.
                     masks = transforms.resize_image(masks, Ly=Ly_0, Lx=Lx_0, no_channels=True, interpolation=cv2.INTER_NEAREST)
                     masks = masks.transpose(1, 0, 2)
                     masks = transforms.resize_image(masks, Ly=Lz_0, Lx=Lx_0, no_channels=True, interpolation=cv2.INTER_NEAREST)
                     masks = masks.transpose(1, 0, 2)
+            elif compute_masks and (return_flows or masks.shape[-2:] != (Ly_0, Lx_0)):
+                masks = transforms.resize_image(masks, Ly=Ly_0, Lx=Lx_0, no_channels=True, interpolation=cv2.INTER_NEAREST)
 
-            else:
-                # 2D or 3D stitching case:
-                if compute_masks:
-                    masks = transforms.resize_image(masks, Ly=Ly_0, Lx=Lx_0, no_channels=True, interpolation=cv2.INTER_NEAREST)
+        if not return_flows:
+            return masks, None, styles
 
+        if image_scaling is not None or anisotropy is not None:
+            dP = self._resize_gradients(
+                dP,
+                to_y_size=Ly_0,
+                to_x_size=Lx_0,
+                to_z_size=Lz_0,
+            )
+            cellprob = self._resize_cellprob(
+                cellprob,
+                to_x_size=Lx_0,
+                to_y_size=Ly_0,
+                to_z_size=Lz_0,
+            )
         return masks, [plot.dx_to_circ(dP), dP, cellprob], styles
 
 

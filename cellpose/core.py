@@ -444,7 +444,6 @@ def run_3D(net, imgs, batch_size=8, augment=False,
                 - "y": np.ndarray of shape [num_slices, H, W, 3] (2D flows + cellprob)
                 - "style": np.ndarray style vector
     """
-    print(f"[run_3D] ENTERING run_3D with shape={imgs.shape}")
     sstr = ["YX", "ZY", "ZX"]
     orient_keys = ["xy", "xz", "yz"]  # match user-facing plane names
     pm = [(0, 1, 2, 3), (1, 0, 2, 3), (2, 0, 1, 3)]
@@ -464,7 +463,6 @@ def run_3D(net, imgs, batch_size=8, augment=False,
         if np.all(weights == 0):
             raise ValueError("At least one plane weight must be positive.")
     # Initialize weight accumulators - arrays when using variance fusion, scalars otherwise
-    print(f"[run_3D] use_variance_fusion={use_variance_fusion}, alpha_flow={variance_alpha_flow}, alpha_cellprob={variance_alpha_cellprob}")
     core_logger.info(f"run_3D: use_variance_fusion={use_variance_fusion}")
     if use_variance_fusion:
         flow_weight_totals = [np.zeros(shape, dtype=np.float32) for _ in range(3)]
@@ -543,12 +541,5 @@ def run_3D(net, imgs, batch_size=8, augment=False,
                 yf[..., axis_idx] /= flow_weight_totals[axis_idx]
         if cellprob_weight_total > 0:
             yf[..., -1] /= cellprob_weight_total
-
-    # Diagnostic: flow statistics per axis (Z, Y, X)
-    axis_names = ['Z', 'Y', 'X']
-    for axis_idx in range(3):
-        flow = yf[..., axis_idx]
-        print(f"[run_3D] {axis_names[axis_idx]}-flow: mean={flow.mean():.4f}, std={flow.std():.4f}, "
-              f"min={flow.min():.4f}, max={flow.max():.4f}")
 
     return yf, style

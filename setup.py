@@ -14,6 +14,7 @@ install_deps = [
     'imagecodecs',
     'roifile',
     'fill-voids',
+    'cupy-cuda12x',
     'segment_anything @ git+https://github.com/chaichontat/segment-anything.git',
     'tensorrt-cu12<10.14',
     'onnx>=1.20.0',
