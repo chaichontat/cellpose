@@ -756,6 +756,11 @@ def get_masks_kde(pt, inds, shape0, rpad=None, max_size_fraction=0.4,
     h_np = h.cpu().numpy().astype(np.float32)
     del h
 
+    # PyTorch and CuPy use independent allocators. Release inactive dynamics
+    # buffers before CuPy allocates the dense KDE working set.
+    if pt.device.type == "cuda":
+        torch.cuda.empty_cache()
+
     # Step 2-4: KDE smoothing, thresholding, and connected components
     use_cupy = use_gpu and CUPY_ENABLED and torch.cuda.is_available()
 

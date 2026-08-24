@@ -257,18 +257,25 @@ class MainW_ortho2D(MainW):
             basename = filepath.stem
             ext = filepath.suffix
 
-            # Try to find Z index using supported patterns:
+            # Find the stack index using supported filename patterns:
             #   (1) basename_z<idx>.<ext>  e.g., sample_z05.tif
             #   (2) basename-<idx>.<ext>   e.g., sample-5.tif
+            #   (3) basename-<axis><idx>.<ext> e.g., sample-z10-x20-y30.tif
             folder = filepath.parent
             m_z = re.match(r'^(.*)_z(\d+)$', basename)
+            m_axis = re.match(r'^(.*-[xyz])(\d+)$', basename)
             m_dash = re.match(r'^(.*)-(\d+)$', basename)
-            if m_z or m_dash:
+            if m_z or m_axis or m_dash:
                 if m_z:
                     family = m_z.group(1)
                     main_z_index = int(m_z.group(2))
                     glob_glob = f"{family}_z*{ext}"
                     stem_regex = re.compile(rf'^{re.escape(family)}_z(\d+)$')
+                elif m_axis:
+                    family = m_axis.group(1)
+                    main_z_index = int(m_axis.group(2))
+                    glob_glob = f"{family}*{ext}"
+                    stem_regex = re.compile(rf'^{re.escape(family)}(\d+)$')
                 else:
                     family = m_dash.group(1)
                     main_z_index = int(m_dash.group(2))
@@ -375,7 +382,7 @@ class MainW_ortho2D(MainW):
                         print(f"GUI_INFO: Ortho stack loaded. Shape={self.stack_ortho.shape}, Main Z index={self.zc_ortho}")
 
             else:
-                print("GUI_WARNING: Filename does not match expected Z-stack pattern (basename_z##.ext or basename-#.ext). Cannot load ortho stack.")
+                print("GUI_WARNING: Filename does not match expected Z-stack pattern (basename_z##.ext, basename-#.ext, or basename-[xyz]##.ext). Cannot load ortho stack.")
                 self.ortho_nz = 1
                 self.stack_ortho = self.stack.copy() # Use main stack
                 self.zc_ortho = 0
