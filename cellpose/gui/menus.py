@@ -84,7 +84,7 @@ def editmenu(parent):
 
     parent.ClearButton = QAction("Clear all masks", parent)
     parent.ClearButton.setShortcut("Ctrl+0")
-    parent.ClearButton.triggered.connect(parent.clear_all)
+    parent.ClearButton.triggered.connect(parent.clear_all_action)
     parent.ClearButton.setEnabled(False)
     edit_menu.addAction(parent.ClearButton)
 

@@ -493,18 +493,29 @@ class MainW_ortho2D(MainW):
 
 
     def update_crosshairs(self):
-        self.yortho = min(self.Ly - 1, max(0, int(self.yortho)))
-        self.xortho = min(self.Lx - 1, max(0, int(self.xortho)))
+        self._set_crosshair((self.yortho, self.xortho))
+
+    def _position_ortho_crosshairs(self, coords):
+        """Clamp and position ortho lines without publishing crosshair state."""
+        y, x = coords
+        self.yortho = min(self.Ly - 1, max(0, int(y)))
+        self.xortho = min(self.Lx - 1, max(0, int(x)))
         self.vLine.setPos(self.xortho)
         self.hLine.setPos(self.yortho)
         self.vLineOrtho[1].setPos(self.xortho)
         self.hLineOrtho[1].setPos(self.zc)
         self.vLineOrtho[0].setPos(self.zc)
         self.hLineOrtho[0].setPos(self.yortho)
-        self._diff_update_crosshair_lines((self.yortho, self.xortho))
+        return self.yortho, self.xortho
 
-    def get_crosshair_coords(self):
-        return float(self.yortho), float(self.xortho)
+    def _set_crosshair(self, coords):
+        if (coords is not None and hasattr(self, "vLineOrtho") and
+                hasattr(self, "hLineOrtho")):
+            try:
+                coords = self._position_ortho_crosshairs(coords)
+            except (TypeError, ValueError, OverflowError):
+                return
+        super()._set_crosshair(coords)
 
     # Developer note (gui_ortho invariants):
     # - Do not change main XY view (self.p0) ranges in this function.

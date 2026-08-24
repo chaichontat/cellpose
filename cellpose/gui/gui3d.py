@@ -346,6 +346,7 @@ class MainW_3d(MainW):
             self.currentZ = min(self.NZ, max(0, int(self.scroll.value())))
             self.zpos.setText(str(self.currentZ))
             self.update_plot()
+            self._refresh_comparison_viewers()
             self.draw_layer()
             self.update_layer()
 

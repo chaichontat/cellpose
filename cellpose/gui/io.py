@@ -122,12 +122,7 @@ def _load_image(parent, filename=None, load_seg=True, load_3D=False):
     if image is grey change view to default to grey scale 
     """
 
-    cache_before = getattr(parent, "_diff_cache_before_image_change", None)
-    if callable(cache_before):
-        try:
-            cache_before()
-        except Exception as exc:
-            print(f"GUI_WARNING: diff state cache before load failed: {exc}")
+    parent._diff_cache_before_image_change()
 
     if parent.load_3D:
         load_3D = True
@@ -176,12 +171,7 @@ def _load_image(parent, filename=None, load_seg=True, load_3D=False):
         if load_mask:
             _load_masks(parent, filename=mask_file)
 
-        cache_after = getattr(parent, "_diff_restore_after_image_load", None)
-        if callable(cache_after):
-            try:
-                cache_after()
-            except Exception as exc:
-                print(f"GUI_WARNING: diff state restore after load failed: {exc}")
+        parent._diff_restore_after_image_load()
 
     # check if gray and adjust viewer:
     if len(np.unique(image[..., 1:])) == 1:
@@ -277,6 +267,8 @@ def _load_seg(parent, filename=None, image=None, image_file=None, load_3D=False)
         print("ERROR: not NPY")
         return
 
+    if image is None:
+        parent._diff_cache_before_image_change()
     parent.reset()
     if image is None:
         found_image = False
@@ -393,6 +385,9 @@ def _load_seg(parent, filename=None, image=None, image_file=None, load_3D=False)
 
     parent.enable_buttons()
     parent.update_layer()
+
+    parent._diff_restore_after_image_load()
+
     del dat
     gc.collect()
 
