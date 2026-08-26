@@ -193,6 +193,12 @@ class CellposeModelTRT(models.CellposeModel):
                 self.net_ortho = TRTEngineModule(
                     self.pretrained_model_ortho, device=dev
                 )
+                if self.net_ortho._in_dims != self.net._in_dims:
+                    raise ValueError(
+                        "Primary and ortho TensorRT engines must have matching input "
+                        f"profiles; got {self.net._in_dims} and {self.net_ortho._in_dims}. "
+                        "Rebuild both engines with the same batch size and bsize."
+                    )
             elif self.net_ortho is None:
                 # Base class didn't load it (shouldn't happen for .pth files)
                 raise ValueError(

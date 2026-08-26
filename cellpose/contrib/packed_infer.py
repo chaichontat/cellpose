@@ -29,6 +29,7 @@ def _run_3d_with_packing(
     bsize: int,
     pack_border: int,
     plane_weights: np.ndarray | None,
+    net_ortho=None,
     return_raw_3d: bool = False,
     flow2D_smooth: float = 0.0,
     use_variance_fusion: bool = False,
@@ -71,6 +72,7 @@ def _run_3d_with_packing(
         weight = float(weights[p])
         xsl = imgs.transpose(pm[p])  # [Z', Y', X', C]
         Lzp, Lyp, Lxp = xsl.shape[:3]
+        active_net = net if p == 0 or net_ortho is None else net_ortho
 
         # Only pack orthogonal planes; keep XY (YX orientation) on the baseline path
         use_pack = sstr[p] != "YX"
@@ -96,7 +98,7 @@ def _run_3d_with_packing(
             )
             packed, mapping = pack_planes_to_stripes(xsl, layout)
             y_packed, styles = run_net(
-                net,
+                active_net,
                 packed,
                 batch_size=batch_size,
                 augment=augment,
@@ -107,7 +109,7 @@ def _run_3d_with_packing(
             y = unpack_stripes_to_planes(y_packed, mapping, Lz=Lzp, Ly=Lyp)
         else:
             y, styles = run_net(
-                net,
+                active_net,
                 xsl,
                 batch_size=batch_size,
                 augment=augment,
@@ -129,7 +131,8 @@ def _run_3d_with_packing(
             # Variance-weighted fusion: weight by inverse local variance
             cellprob_3d = y[..., -1].transpose(ipm[p])
             w_cellprob = _compute_variance_weights(
-                cellprob_3d, alpha=variance_alpha_cellprob, use_gpu=True)
+                cellprob_3d, alpha=variance_alpha_cellprob, use_gpu=True
+            )
             yf[..., -1] += weight * w_cellprob * cellprob_3d
             cellprob_weight_total += weight * w_cellprob
 
@@ -137,7 +140,8 @@ def _run_3d_with_packing(
                 axis_idx = cp[p][j]
                 flow_3d = y[..., cpy[p][j]].transpose(ipm[p])
                 w_flow = _compute_variance_weights(
-                    flow_3d, alpha=variance_alpha_flow, use_gpu=True)
+                    flow_3d, alpha=variance_alpha_flow, use_gpu=True
+                )
                 yf[..., axis_idx] += weight * w_flow * flow_3d
                 flow_weight_totals[axis_idx] += weight * w_flow
         else:
@@ -211,6 +215,7 @@ class Packed3DMixin:
             tile_overlap=tile_overlap,
             bsize=bsize,
             pack_border=getattr(self, "_pack_border", _PACK_STRIPE_BORDER),
+            net_ortho=getattr(self, "net_ortho", None),
             return_raw_3d=return_raw_3d,
             **kwargs,
         )
