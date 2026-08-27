@@ -61,6 +61,31 @@ def test_seg_load_calls_diff_restore_once(tmp_path, monkeypatch):
     assert parent.loaded
 
 
+def test_autoload_masks_does_not_override_seg_npy(tmp_path, monkeypatch):
+    events: list[str] = []
+    parent = _parent(events)
+    parent.autoloadMasks = SimpleNamespace(isChecked=lambda: True)
+    image_path = tmp_path / "sample.tif"
+    image_path.touch()
+    (tmp_path / "sample_seg.npy").touch()
+    (tmp_path / "sample_masks.tif").touch()
+    monkeypatch.setattr(
+        io, "imread_2D", lambda filename: np.zeros((4, 5, 3), dtype=np.uint8)
+    )
+
+    monkeypatch.setattr(
+        io, "_load_seg", lambda *args, **kwargs: events.append("load_seg")
+    )
+    monkeypatch.setattr(
+        io, "_load_masks", lambda *args, **kwargs: events.append("load_masks")
+    )
+
+    io._load_image(parent, filename=str(image_path), load_seg=True)
+
+    assert "load_seg" in events
+    assert "load_masks" not in events
+
+
 def test_failed_seg_load_does_not_restore_diff(tmp_path):
     events: list[str] = []
     parent = _parent(events)

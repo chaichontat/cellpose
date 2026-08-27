@@ -61,6 +61,63 @@ def _read_ortho_mask_plane(image_filename, expected_shape):
     return masks
 
 
+def _sync_live_ortho_mask_plane(ortho_masks, ortho_outlines, live_masks,
+                                live_outlines, ortho_index, current_z):
+    """Replace the disk-loaded center plane with the editable GUI mask plane."""
+    arrays = (ortho_masks, ortho_outlines, live_masks, live_outlines)
+    if not all(isinstance(array, np.ndarray) and array.ndim == 3 for array in arrays):
+        return ortho_masks, ortho_outlines
+    if not (0 <= ortho_index < ortho_masks.shape[0]
+            and 0 <= current_z < live_masks.shape[0]
+            and current_z < live_outlines.shape[0]):
+        return ortho_masks, ortho_outlines
+    if (ortho_masks.shape[1:] != live_masks.shape[1:]
+            or ortho_outlines.shape[1:] != live_outlines.shape[1:]):
+        return ortho_masks, ortho_outlines
+
+    mask_dtype = np.result_type(ortho_masks.dtype, live_masks.dtype)
+    outline_dtype = np.result_type(ortho_outlines.dtype, live_outlines.dtype)
+    if ortho_masks.dtype != mask_dtype:
+        ortho_masks = ortho_masks.astype(mask_dtype)
+    if ortho_outlines.dtype != outline_dtype:
+        ortho_outlines = ortho_outlines.astype(outline_dtype)
+    ortho_masks[ortho_index] = live_masks[current_z]
+    ortho_outlines[ortho_index] = live_outlines[current_z]
+    return ortho_masks, ortho_outlines
+
+
+def _render_ortho_mask_overlay(mask_section, outline_section, masks_on, outlines_on,
+                               cellcolors, colormap, opacity, outcolor, selected=0,
+                               outline_opacity=160):
+    """Render one literal mask/outline cross-section as an RGBA overlay."""
+    source = mask_section if mask_section is not None else outline_section
+    if source is None:
+        raise ValueError("mask_section and outline_section cannot both be None")
+    layer = np.zeros((*source.shape, 4), dtype=np.uint8)
+
+    if masks_on and mask_section is not None:
+        labels = np.asarray(mask_section)
+        colors = np.asarray(cellcolors, dtype=np.uint8)[..., :3]
+        known = (labels > 0) & (labels < len(colors))
+        rgb = layer[..., :3]
+        if np.any(known):
+            rgb[known] = colors[labels[known]]
+        unknown = (labels > 0) & ~known
+        palette = np.asarray(colormap, dtype=np.uint8)[..., :3]
+        if np.any(unknown) and len(palette):
+            color_idx = (labels[unknown].astype(np.int64) - 1) % len(palette)
+            rgb[unknown] = palette[color_idx]
+        alpha = int(np.clip(opacity, 0, 255))
+        layer[..., 3] = alpha * (labels > 0).astype(np.uint8)
+        if selected > 0:
+            layer[labels == selected] = np.array([255, 255, 255, alpha], np.uint8)
+
+    if outlines_on and outline_section is not None:
+        outline_rgba = np.asarray(outcolor, dtype=np.uint8).copy()
+        outline_rgba[3] = min(int(outline_rgba[3]), int(outline_opacity))
+        layer[np.asarray(outline_section) > 0] = outline_rgba
+    return layer
+
 
 def run(image=None):
     from ..io import logger_setup
@@ -121,6 +178,7 @@ class MainW_ortho2D(MainW):
         self.xortho = 0         # X coordinate for ortho crosshair
         self.yortho = 0         # Y coordinate for ortho crosshair
         self.zc_ortho = 0       # Z index of the main plane within stack_ortho
+        self._ortho_main_stack_index = 0  # Fixed plane represented by the editable XY image
         self.dz = 10            # Number of Z planes to show above/below main plane in ortho views
         self.zaspect = 6.0      # Z-aspect ratio for ortho views
         self.ortho_outline_opacity = 160  # Keep orthoview boundaries slightly transparent
@@ -452,6 +510,9 @@ class MainW_ortho2D(MainW):
             self.ortho_files_sorted = []
 
         # 3. Finalize setup
+        # Keep this fixed when ortho clicks move zc_ortho; the editable XY image
+        # still represents the originally loaded file.
+        self._ortho_main_stack_index = self.zc_ortho
         # Update saturation array length if NZ_ortho changed
 
         # Initialize ortho view position to center of main image
@@ -755,8 +816,10 @@ class MainW_ortho2D(MainW):
             np.zeros((zrange, self.Lx, 4), "uint8")
         ]
 
-        cellpix = getattr(self, "cellpix", None)
-        outpix = getattr(self, "outpix", None)
+        live_cellpix = getattr(self, "cellpix", None)
+        live_outpix = getattr(self, "outpix", None)
+        cellpix = live_cellpix
+        outpix = live_outpix
         ortho_cellpix = getattr(self, "ortho_mask_stack", None)
         ortho_outpix = getattr(self, "ortho_outline_stack", None)
         use_ortho_masks = (
@@ -765,6 +828,16 @@ class MainW_ortho2D(MainW):
             and ortho_cellpix.shape[0] == self.ortho_nz
         )
         if use_ortho_masks:
+            ortho_cellpix, ortho_outpix = _sync_live_ortho_mask_plane(
+                ortho_cellpix,
+                ortho_outpix,
+                live_cellpix,
+                live_outpix,
+                int(getattr(self, "_ortho_main_stack_index", self.zc_ortho)),
+                int(getattr(self, "currentZ", 0)),
+            )
+            self.ortho_mask_stack = ortho_cellpix
+            self.ortho_outline_stack = ortho_outpix
             cellpix = ortho_cellpix
             outpix = ortho_outpix
         masks_available = (
@@ -860,74 +933,19 @@ class MainW_ortho2D(MainW):
                         op_sections[0][:, k] = outpix[seg_idx, :, source_x][outline_idx_y]
                         op_sections[1][k, :] = outpix[seg_idx, source_y, :][outline_idx_x]
 
-                if use_ortho_masks and outlines_available:
-                    # Outline the assembled YZ/XZ sections themselves. Slicing XY
-                    # outlines alone would omit boundaries facing along the Z axis.
-                    op_sections = [
-                        masks_to_outlines(section) * section for section in cp_sections
-                    ]
-
-                if masks_available:
-                    cellcolors = np.asarray(self.cellcolors, dtype=np.uint8)
-                    selected_idx = int(getattr(self, "selected", 0))
-                    opacity_val = int(np.clip(getattr(self, "opacity", 0), 0, 255))
-                    z_slice = slice(local_from, local_to_excl)
-                    for j, cp_slice in enumerate(cp_sections):
-                        if cp_slice is None:
-                            continue
-                        if j == 0:
-                            cp_segment = cp_slice[:, z_slice]
-                            if cp_segment.size > 0:
-                                layer_view = self.layer_ortho[j][:, z_slice]
-                                known = cp_segment < cellcolors.shape[0]
-                                if np.any(known):
-                                    layer_view[..., :3][known] = cellcolors[cp_segment[known], :]
-                                unknown = (cp_segment > 0) & ~known
-                                if np.any(unknown):
-                                    palette = np.asarray(self.colormap, dtype=np.uint8)[..., :3]
-                                    color_idx = (cp_segment[unknown].astype(np.int64) - 1) % len(palette)
-                                    layer_view[..., :3][unknown] = palette[color_idx]
-                                alpha_block = (opacity_val * (cp_segment > 0).astype(np.uint8)).astype(np.uint8)
-                                layer_view[..., 3] = alpha_block
-                                if selected_idx > 0:
-                                    sel_mask = cp_segment == selected_idx
-                                    if np.any(sel_mask):
-                                        layer_view[sel_mask] = np.array(
-                                            [255, 255, 255, opacity_val], dtype=np.uint8
-                                        )
-                        else:
-                            cp_segment = cp_slice[z_slice, :]
-                            if cp_segment.size > 0:
-                                layer_view = self.layer_ortho[j][z_slice, :]
-                                known = cp_segment < cellcolors.shape[0]
-                                if np.any(known):
-                                    layer_view[..., :3][known] = cellcolors[cp_segment[known], :]
-                                unknown = (cp_segment > 0) & ~known
-                                if np.any(unknown):
-                                    palette = np.asarray(self.colormap, dtype=np.uint8)[..., :3]
-                                    color_idx = (cp_segment[unknown].astype(np.int64) - 1) % len(palette)
-                                    layer_view[..., :3][unknown] = palette[color_idx]
-                                alpha_block = (opacity_val * (cp_segment > 0).astype(np.uint8)).astype(np.uint8)
-                                layer_view[..., 3] = alpha_block
-                                if selected_idx > 0:
-                                    sel_mask = cp_segment == selected_idx
-                                    if np.any(sel_mask):
-                                        layer_view[sel_mask] = np.array(
-                                            [255, 255, 255, opacity_val], dtype=np.uint8
-                                        )
-
-                if outlines_available:
-                    outline_rgba = np.array(self.outcolor, dtype=np.uint8)
-                    outline_rgba[3] = min(
-                        int(outline_rgba[3]),
-                        int(getattr(self, "ortho_outline_opacity", 160)),
+                for j in range(2):
+                    self.layer_ortho[j] = _render_ortho_mask_overlay(
+                        cp_sections[j],
+                        op_sections[j],
+                        masks_available,
+                        outlines_available,
+                        self.cellcolors,
+                        self.colormap,
+                        getattr(self, "opacity", 0),
+                        self.outcolor,
+                        selected=int(getattr(self, "selected", 0)),
+                        outline_opacity=int(getattr(self, "ortho_outline_opacity", 160)),
                     )
-                    for j, op_slice in enumerate(op_sections):
-                        if op_slice is None:
-                            continue
-                        outline_mask = op_slice > 0
-                        if np.any(outline_mask):
-                            self.layer_ortho[j][outline_mask] = outline_rgba
 
         for j in range(2):
             self.layerOrtho[j].setImage(self.layer_ortho[j])
@@ -1003,6 +1021,14 @@ class MainW_ortho2D(MainW):
         super().update_plot() # Update main view first
         if self.loaded and hasattr(self, 'orthobtn') and self.orthobtn.isChecked():
             self.update_ortho() # Update ortho views after main view updates
+
+
+    def update_layer(self):
+        """Update XY and orthoview overlays after live mask edits."""
+        super().update_layer()
+        if (getattr(self, "loaded", False) and hasattr(self, "orthobtn")
+                and self.orthobtn.isChecked()):
+            self.update_ortho()
 
 
     def keyPressEvent(self, event):

@@ -135,7 +135,9 @@ def _load_image(parent, filename=None, load_seg=True, load_3D=False):
     manual_file = os.path.splitext(filename)[0] + "_seg.npy"
     load_mask = False
     if load_seg:
-        if os.path.isfile(manual_file) and not parent.autoloadMasks.isChecked():
+        # A saved Cellpose session contains more information than an exported
+        # mask image, so always prefer it even when mask autoloading is enabled.
+        if os.path.isfile(manual_file):
             if filename is not None:
                 image = (imread_2D(filename) if not load_3D else 
                          imread_3D(filename))
