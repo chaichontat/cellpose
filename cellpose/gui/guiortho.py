@@ -21,7 +21,7 @@ import cv2
 from . import guiparts, menus, io
 from .. import models, core, dynamics, version
 from ..utils import download_url_to_file, masks_to_outlines, diameters
-from ..io import get_image_files, imsave, imread
+from ..io import get_image_files, imread, imsave
 from ..transforms import resize_image, normalize99  #fixed import
 from ..plot import disk
 from ..transforms import normalize99_tile, smooth_sharpen_img
@@ -418,14 +418,9 @@ class MainW_ortho2D(MainW):
                         load_seg and autoload_action is not None
                         and autoload_action.isChecked()
                     )
-                    for i, (z_idx, f) in enumerate(zip(sorted_z, sorted_files)):
+                    for z_idx, f in zip(sorted_z, sorted_files):
                         try:
-                            img = imread(f)
-                            # Basic preprocessing (like in io._load_image)
-                            if img.ndim == 2:
-                                img = img[:, :, np.newaxis]
-                            if img.shape[0] < 4 or img.shape[1] < 4: # Handle channel dim placement
-                                img = np.transpose(img, (1,2,0))
+                            img = io.imread_2D(f)
                             # Check shape consistency
                             current_shape = img.shape[:2] + (img.shape[2],) # Y, X, C
                             if ref_shape is None:
@@ -433,11 +428,6 @@ class MainW_ortho2D(MainW):
                             elif current_shape[:2] != ref_shape[:2]: # Check Y, X only
                                 print(f"GUI_WARNING: Skipping file {f} due to shape mismatch ({current_shape[:2]} vs {ref_shape[:2]})")
                                 continue
-                            # Ensure 3 channels if RGB mode is likely
-                            if self.nchan > 1 and img.shape[-1] == 1: # If main img is color, expand gray Z
-                                img = np.repeat(img, 3, axis=-1)
-                            elif img.shape[-1] > 3: # Take first 3 channels if more exist
-                                img = img[..., :3]
                             images.append(img)
                             if autoload_ortho_masks:
                                 mask = _read_ortho_mask_plane(f, current_shape[:2])
@@ -458,13 +448,9 @@ class MainW_ortho2D(MainW):
                         # Stack images into numpy array
                         self.stack_ortho = np.stack(images, axis=0) # (NZ, Ly, Lx, C)
 
-                        img_min = self.stack_ortho.min()
-                        img_max = self.stack_ortho.max()
-                        self.stack_ortho = self.stack_ortho.astype(np.float32)
-                        self.stack_ortho -= img_min
-                        if img_max > img_min + 1e-3:
-                            self.stack_ortho /= (img_max - img_min)
-                        self.stack_ortho *= 255
+                        self.stack_ortho, _ = io._normalize_image_for_display(
+                            self.stack_ortho, self._display_range
+                        )
                         self.ortho_nz = self.stack_ortho.shape[0]
                         # Keep file list aligned with stacked images
                         self.ortho_files_sorted = used_files
@@ -484,9 +470,6 @@ class MainW_ortho2D(MainW):
                             )
                         print(self.stack_ortho.min(), self.stack_ortho.max())
 
-                        if self.stack_ortho.shape[-1] != 3:
-                            self.stack_ortho = np.concatenate((self.stack_ortho, np.zeros((self.stack_ortho.shape[0], self.stack_ortho.shape[1], self.stack_ortho.shape[2], 1), dtype=self.stack_ortho.dtype)), axis=-1)
-                        #   self.NZ = self.stack_ortho.shape[0]
                         # Find the Z-index of the main loaded image
                         try:
                             self.zc_ortho = used_z_indices.index(main_z_index)

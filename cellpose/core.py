@@ -287,7 +287,7 @@ def _forward(net, x):
 
 
 def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
-            rsz=None, single_tile_if_fit=False):
+            rsz=None, single_tile_if_fit=False, skip_empty_tiles=False):
     """
     Run network on stack of images.
     (faster if augment is False)
@@ -300,6 +300,8 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         augment (bool, optional): Tiles image with overlapping tiles and flips overlapped regions to augment. Defaults to False.
         tile_overlap (float, optional): Fraction of overlap of tiles when computing flows. Defaults to 0.1.
         bsize (int, optional): Size of tiles to use in pixels [bsize x bsize]. Defaults to 224.
+        skip_empty_tiles (bool, optional): Skip all-zero network tiles and scatter
+            zero outputs back into their positions. Defaults to False.
 
     Returns:
         Tuple[numpy.ndarray, numpy.ndarray]: outputs of network y and style. If tiled `y` is averaged in tile overlaps. Size of [Ly x Lx x 3] or [Lz x Ly x Lx x 3].
@@ -364,6 +366,10 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
     )
     ziterator = (trange(niter, file=tqdm_out, mininterval=30)
                     if niter > 10 or Lz > 1 else range(niter))
+    nout = net.nout if hasattr(net, "nout") else 3
+    yf = np.zeros((Lz, nout, Ly, Lx), "float32")
+    styles = np.zeros((Lz, 256), "float32")
+    skipped_tiles = 0
     for k in ziterator:
         inds = np.arange(k * nimgs, min(Lz, (k + 1) * nimgs))
         IMGa = np.zeros((ntiles * len(inds), nchan, ly, lx), "float32")
@@ -376,22 +382,26 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
                 tile_overlap=(0.0 if (single_tile_if_fit and not augment and Lx <= bsize and Ly <= bsize) else tile_overlap))
             IMGa[i * ntiles : (i+1) * ntiles] = np.reshape(IMG,
                                             (ny * nx, nchan, ly, lx))
-        # run network
-        for j in range(0, IMGa.shape[0], batch_size):
-            bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
-            ya0, stylea0 = _forward(net, IMGa[bslc])
-            if j == 0:
-                nout = ya0.shape[1]
-                ya = np.zeros((IMGa.shape[0], nout, ly, lx), "float32")
-                stylea = np.zeros((IMGa.shape[0], 256), "float32")
-            ya[bslc] = ya0
-            stylea[bslc] = stylea0
+        active_tiles = (
+            np.flatnonzero(np.any(IMGa != 0, axis=(1, 2, 3)))
+            if skip_empty_tiles
+            else np.arange(IMGa.shape[0])
+        )
+        skipped_tiles += IMGa.shape[0] - len(active_tiles)
+        ya = np.zeros((IMGa.shape[0], nout, ly, lx), "float32")
+        stylea = np.zeros((IMGa.shape[0], 256), "float32")
+        for j in range(0, len(active_tiles), batch_size):
+            batch_indices = active_tiles[j : j + batch_size]
+            ya0, stylea0 = _forward(net, IMGa[batch_indices])
+            if ya0.shape[1] != nout:
+                raise ValueError(
+                    f"Network returned {ya0.shape[1]} channels; expected {nout}."
+                )
+            ya[batch_indices] = ya0
+            stylea[batch_indices] = stylea0
 
         # average tiles
         for i, b in enumerate(inds):
-            if i==0 and k==0:
-                yf = np.zeros((Lz, nout, Ly, Lx), "float32")
-                styles = np.zeros((Lz, 256), "float32")
             y = ya[i * ntiles : (i + 1) * ntiles]
             if augment:
                 y = np.reshape(y, (ny, nx, 3, ly, lx))
@@ -402,6 +412,8 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             # stylei = stylea[i * ntiles:(i + 1) * ntiles].sum(axis=0)
             # stylei /= (stylei**2).sum()**0.5
             # styles[b] = stylei
+    if skip_empty_tiles:
+        core_logger.info("skipped %d all-zero network tiles", skipped_tiles)
     # slices from padding
     yf = yf[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
     yf = yf.transpose(0,2,3,1)
@@ -412,7 +424,8 @@ def run_3D(net, imgs, batch_size=8, augment=False,
            tile_overlap=0.1, bsize=224, net_ortho=None,
            progress=None, plane_weights=None,
            return_raw=False, flow2D_smooth=0.0,
-           use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5):
+           use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5,
+           skip_empty_tiles=False):
     """
     Run network on image z-stack.
 
@@ -437,6 +450,8 @@ def run_3D(net, imgs, batch_size=8, augment=False,
             Defaults to 0.5 (conservative).
         variance_alpha_cellprob (float, optional): Alpha for cellprob variance weighting.
             Defaults to 1e-5 (aggressive, strongly trust smooth predictions).
+        skip_empty_tiles (bool, optional): Skip all-zero 2D network tiles and
+            scatter zero outputs into their positions. Defaults to False.
 
     Returns:
         If `return_raw` is True:
@@ -483,7 +498,7 @@ def run_3D(net, imgs, batch_size=8, augment=False,
         y, style = run_net(active_net,
                            xsl, batch_size=batch_size, augment=augment,
                            bsize=bsize, tile_overlap=tile_overlap,
-                           rsz=None)
+                           rsz=None, skip_empty_tiles=skip_empty_tiles)
 
         # Apply 2D pre-smoothing before aggregation (u-Segment3D)
         if flow2D_smooth > 0:

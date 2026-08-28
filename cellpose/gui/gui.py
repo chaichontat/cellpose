@@ -1615,7 +1615,7 @@ class MainW(QMainWindow):
 
         self._diff_close_existing()
 
-        fig, ax = plt.subplots(figsize=(8, 8))
+        fig, ax = plt.subplots(figsize=(6, 6))
         height, width = diff_rgb.shape[:2]
         im = ax.imshow(
             diff_rgb,
@@ -1626,10 +1626,10 @@ class MainW(QMainWindow):
         ax.axis("off")
         ax.set_xlim(-0.5, width - 0.5)
         ax.set_ylim(height - 0.5, -0.5)
-        try:
-            fig.canvas.manager.set_window_title("Cellpose segmentation diff")
-        except Exception:
-            pass
+        manager = getattr(fig.canvas, "manager", None)
+        set_title = getattr(manager, "set_window_title", None)
+        if callable(set_title):
+            set_title("Cellpose segmentation diff")
         fig.tight_layout()
         self._diff_fig = fig
         self._diff_ax = ax
@@ -1644,6 +1644,10 @@ class MainW(QMainWindow):
         self._diff_update_crosshair_lines()
         fig.show()
         plt.show(block=False)
+        native_window = getattr(manager, "window", None)
+        show_normal = getattr(native_window, "showNormal", None)
+        if callable(show_normal):
+            show_normal()
         self._diff_log("diff viewer open: click magenta to accept saved label, green to accept model label")
 
     def _gradxy_current_plane(self):

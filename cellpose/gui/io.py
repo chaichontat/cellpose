@@ -181,7 +181,23 @@ def _load_image(parent, filename=None, load_seg=True, load_3D=False):
         parent.RGBDropDown.setCurrentIndex(4) # gray
         parent.update_plot()
 
-        
+
+def _normalize_image_for_display(image, value_range=None):
+    """Map raw image values into the main view's display coordinate system."""
+    if value_range is None:
+        image_min = float(image.min())
+        image_max = float(image.max())
+    else:
+        image_min, image_max = value_range
+
+    normalized = image.astype(np.float32)
+    normalized -= image_min
+    if image_max > image_min + 1e-3:
+        normalized /= image_max - image_min
+    normalized *= 255
+    return normalized, (image_min, image_max)
+
+
 def _initialize_images(parent, image, load_3D=False):
     """ format image for GUI
 
@@ -199,13 +215,7 @@ def _initialize_images(parent, image, load_3D=False):
         parent.NZ = 1
         parent.stack = parent.stack[np.newaxis, ...]
 
-    img_min = image.min()
-    img_max = image.max()
-    parent.stack = parent.stack.astype(np.float32)
-    parent.stack -= img_min
-    if img_max > img_min + 1e-3:
-        parent.stack /= (img_max - img_min)
-    parent.stack *= 255
+    parent.stack, parent._display_range = _normalize_image_for_display(parent.stack)
 
     if load_3D:
         print("GUI_INFO: converted to float and normalized values to 0.0->255.0")

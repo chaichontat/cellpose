@@ -199,7 +199,7 @@ class CellposeModel():
              return_raw_3d=False, momentum=0.0, step_decay=0.0,
              use_kde_clustering=False, kde_sigma=1.0, kde_threshold_k=1.0,
              use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5,
-             return_flows=True):
+             return_flows=True, skip_empty_tiles=False):
         """ segment list of images x, or 4D array - Z x 3 x Y x X
 
         Args:
@@ -304,7 +304,8 @@ class CellposeModel():
                     kde_threshold_k=kde_threshold_k,
                     use_variance_fusion=use_variance_fusion,
                     variance_alpha_flow=variance_alpha_flow,
-                    variance_alpha_cellprob=variance_alpha_cellprob)
+                    variance_alpha_cellprob=variance_alpha_cellprob,
+                    skip_empty_tiles=skip_empty_tiles)
                 masks.append(maski)
                 flows.append(flowi)
                 styles.append(stylei)
@@ -377,7 +378,8 @@ class CellposeModel():
             flow2D_smooth=flow2D_smooth,
             use_variance_fusion=use_variance_fusion,
             variance_alpha_flow=variance_alpha_flow,
-            variance_alpha_cellprob=variance_alpha_cellprob)
+            variance_alpha_cellprob=variance_alpha_cellprob,
+            skip_empty_tiles=skip_empty_tiles)
 
         if return_raw_3d and do_3D:
             return run_net_outputs
@@ -535,7 +537,8 @@ class CellposeModel():
                 bsize=256, anisotropy=1.0, do_3D=False,
                 plane_weights=None,
                 return_raw_3d=False, flow2D_smooth=0.0,
-                use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5):
+                use_variance_fusion=False, variance_alpha_flow=0.5, variance_alpha_cellprob=1e-5,
+                skip_empty_tiles=False):
         """ run network on image x """
         tic = time.time()
         shape = x.shape
@@ -564,6 +567,7 @@ class CellposeModel():
                     use_variance_fusion=use_variance_fusion,
                     variance_alpha_flow=variance_alpha_flow,
                     variance_alpha_cellprob=variance_alpha_cellprob,
+                    skip_empty_tiles=skip_empty_tiles,
                 )
                 return raw_outputs
 
@@ -580,6 +584,7 @@ class CellposeModel():
                 use_variance_fusion=use_variance_fusion,
                 variance_alpha_flow=variance_alpha_flow,
                 variance_alpha_cellprob=variance_alpha_cellprob,
+                skip_empty_tiles=skip_empty_tiles,
             )
             cellprob = yf[..., -1]
             dP = yf[..., :-1].transpose((3, 0, 1, 2))
@@ -587,6 +592,7 @@ class CellposeModel():
             yf, styles = run_net(self.net, x, bsize=bsize, augment=augment,
                                 batch_size=batch_size,
                                 tile_overlap=tile_overlap,
+                                skip_empty_tiles=skip_empty_tiles,
                                 )
             cellprob = yf[..., -1]
             dP = yf[..., -3:-1].transpose((3, 0, 1, 2))

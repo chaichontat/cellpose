@@ -236,3 +236,56 @@ def test_gradxy_click_requires_primary_button():
     MainW._on_gradxy_click(parent, event)
 
     assert updates == [(2.0, 4.0)]
+
+
+def test_diff_window_opens_in_normal_state(tmp_path, monkeypatch):
+    subplots_kwargs = {}
+    window_state = SimpleNamespace(normal_calls=0)
+    window_state.showNormal = lambda: setattr(
+        window_state, "normal_calls", window_state.normal_calls + 1)
+    manager = SimpleNamespace(
+        window=window_state,
+        set_window_title=lambda title: None,
+    )
+    canvas = SimpleNamespace(
+        manager=manager,
+        mpl_connect=lambda event, callback: 1,
+    )
+    figure = SimpleNamespace(
+        canvas=canvas,
+        tight_layout=lambda: None,
+        show=lambda: None,
+    )
+    axes = SimpleNamespace(
+        imshow=lambda *args, **kwargs: object(),
+        axis=lambda value: None,
+        set_xlim=lambda *args: None,
+        set_ylim=lambda *args: None,
+    )
+    seg_path = tmp_path / "image_seg.npy"
+    seg_path.touch()
+    parent = SimpleNamespace(
+        _diff_seg_path=str(seg_path),
+        _diff_state_new={"masks": np.zeros((1, 2, 2), dtype=np.uint16)},
+        _diff_get_saved_state=lambda reload: {
+            "masks": np.zeros((1, 2, 2), dtype=np.uint16)
+        },
+        _diff_recompute_overlay=lambda: np.zeros((2, 2, 3), dtype=np.uint8),
+        _diff_close_existing=lambda: None,
+        _diff_update_crosshair_lines=lambda: None,
+        _diff_on_close=lambda event: None,
+        _on_diff_click=lambda event: None,
+        _on_diff_scroll=lambda event: None,
+        _diff_log=lambda message: None,
+    )
+    def subplots(**kwargs):
+        subplots_kwargs.update(kwargs)
+        return figure, axes
+
+    monkeypatch.setattr(gui_module.plt, "subplots", subplots)
+    monkeypatch.setattr(gui_module.plt, "show", lambda **kwargs: None)
+
+    MainW.show_segmentation_diff(parent)
+
+    assert subplots_kwargs["figsize"] == (6, 6)
+    assert window_state.normal_calls == 1

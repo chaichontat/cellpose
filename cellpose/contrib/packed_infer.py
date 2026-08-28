@@ -35,6 +35,7 @@ def _run_3d_with_packing(
     use_variance_fusion: bool = False,
     variance_alpha_flow: float = 0.5,
     variance_alpha_cellprob: float = 1e-5,
+    skip_empty_tiles: bool = False,
 ):
     # No **kwargs - all parameters must be explicitly defined
     sstr = ["YX", "ZY", "ZX"]
@@ -105,6 +106,7 @@ def _run_3d_with_packing(
                 tile_overlap=tile_overlap,
                 bsize=bsize,
                 single_tile_if_fit=True,
+                skip_empty_tiles=skip_empty_tiles,
             )
             y = unpack_stripes_to_planes(y_packed, mapping, Lz=Lzp, Ly=Lyp)
         else:
@@ -115,6 +117,7 @@ def _run_3d_with_packing(
                 augment=augment,
                 tile_overlap=tile_overlap,
                 bsize=bsize,
+                skip_empty_tiles=skip_empty_tiles,
             )
 
         # Apply 2D pre-smoothing before aggregation (u-Segment3D)
