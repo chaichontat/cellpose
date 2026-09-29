@@ -432,6 +432,7 @@ def _load_masks(parent, filename=None):
         return
 
     _masks_to_gui(parent, masks, outlines)
+    parent._diff_store_current_as_saved()
     if parent.ncells > 0:
         parent.draw_layer()
         parent.toggle_mask_ops()

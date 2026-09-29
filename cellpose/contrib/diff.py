@@ -63,6 +63,7 @@ def contour_diff_rgb(
     labels_a: np.ndarray,
     labels_b: np.ndarray,
     *,
+    upsample: int = 1,
     tol_pixels: float = 2.0,
     min_component_size: int = 20,
     connectivity: int = 8,
@@ -81,6 +82,9 @@ def contour_diff_rgb(
     ----------
     labels_a, labels_b : np.ndarray
         2D integer label images of identical shape. Values are region IDs.
+    upsample : int, default 1
+        Nearest-neighbor scale applied to labels before contour extraction.
+        This increases display resolution without thickening the contours.
     tol_pixels : float, default 2.0
         Tolerance (in pixels) for matching boundaries. Boundary pixels in A
         within `tol_pixels` of any boundary pixel in B (and vice versa) are
@@ -99,7 +103,7 @@ def contour_diff_rgb(
 
     Returns
     -------
-    rgb : (H, W, 3) np.uint8
+    rgb : (H * upsample, W * upsample, 3) np.uint8
         Visualization suitable for `plt.imshow(rgb)`.
 
     Color semantics
@@ -115,6 +119,15 @@ def contour_diff_rgb(
         raise ValueError("labels_a and labels_b must have the same shape.")
     if labels_a.ndim != 2 or labels_b.ndim != 2:
         raise ValueError("labels_a and labels_b must be 2D arrays.")
+    if isinstance(upsample, bool) or not isinstance(upsample, (int, np.integer)):
+        raise ValueError("upsample must be a positive integer.")
+    if upsample < 1:
+        raise ValueError("upsample must be a positive integer.")
+    if upsample > 1:
+        labels_a = np.repeat(np.repeat(labels_a, upsample, axis=0), upsample, axis=1)
+        labels_b = np.repeat(np.repeat(labels_b, upsample, axis=0), upsample, axis=1)
+        tol_pixels *= upsample
+        min_component_size = int(np.ceil(min_component_size * upsample))
 
     # 1) Extract thin contour sets
     C_a = _label_to_contour(labels_a, connectivity=connectivity)

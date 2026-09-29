@@ -903,6 +903,9 @@ class MainW(QMainWindow):
             self.saveROIs.setEnabled(False)
 
     def _diff_refresh_seg_path(self):
+        if self._diff_state_old_manual_override and self._diff_state_old is not None:
+            self._diff_update_button_state()
+            return
         self._diff_state_old = None
         self._diff_state_old_manual_override = False
         if isinstance(self.filename, str) and self.filename:
@@ -919,8 +922,10 @@ class MainW(QMainWindow):
     def _diff_update_button_state(self):
         if not hasattr(self, "diffButton"):
             return
-        seg_path = self._diff_seg_path
-        has_saved = seg_path is not None and os.path.exists(seg_path)
+        saved_state = self._diff_get_saved_state(reload=False)
+        has_saved = (isinstance(saved_state, dict) and
+                     isinstance(saved_state.get("masks"), np.ndarray) and
+                     saved_state["masks"].ndim >= 2)
         state_new = self._diff_state_new
         has_prediction = isinstance(state_new, dict) and isinstance(
             state_new.get("masks"), np.ndarray)
@@ -929,13 +934,13 @@ class MainW(QMainWindow):
 
         self.diffButton.setEnabled(enabled)
         if not has_saved:
-            diff_tip = "Load an image with an existing _seg.npy to enable diff."
+            diff_tip = "Load an image with existing masks to enable diff."
         elif not has_prediction or not prediction_dims_ok:
             diff_tip = "Run a segmentation model to enable diff."
         else:
-            diff_tip = ("Compare current Z plane against saved _seg.npy."
+            diff_tip = ("Compare current Z plane against loaded masks."
                         if getattr(self, "NZ", 1) > 1
-                        else "Open contour diff against saved _seg.npy.")
+                        else "Open contour diff against loaded masks.")
             if not MATPLOTLIB:
                 diff_tip += " (Matplotlib required; click to see installation hint.)"
         self.diffButton.setToolTip(diff_tip)
@@ -948,7 +953,7 @@ class MainW(QMainWindow):
                 base_tip = "Show latest model prediction"
             else:
                 self.maskToggleButton.setText("reset mask")
-                base_tip = "Show saved _seg.npy segmentation"
+                base_tip = "Show loaded mask segmentation"
             self.maskToggleButton.setToolTip(base_tip if can_reset else reset_tip)
 
         if hasattr(self, "gradxyButton"):
@@ -1124,7 +1129,7 @@ class MainW(QMainWindow):
     def _diff_can_reset(self) -> tuple[bool, str]:
         state_old = self._diff_get_saved_state(reload=False)
         if state_old is None or state_old.get("masks") is None:
-            return False, "Saved _seg.npy masks unavailable for reset."
+            return False, "Loaded masks unavailable for reset."
         if self._diff_state_new is None or self._diff_state_new.get("masks") is None:
             return False, "Run a segmentation model before resetting masks."
         try:
@@ -1187,6 +1192,13 @@ class MainW(QMainWindow):
     def _diff_store_current_as_new(self):
         self._diff_state_new = snapshot_current_masks(self)
 
+    def _diff_store_current_as_saved(self):
+        self._diff_state_old = snapshot_current_masks(self)
+        self._diff_state_old_manual_override = True
+        self._diff_showing_restored = True
+        self._diff_update_button_state()
+        self._refresh_comparison_viewers()
+
     def _diff_apply_state(self, state: dict):
         if state is None or state.get("masks") is None:
             raise ValueError("diff state missing masks")
@@ -1237,9 +1249,10 @@ class MainW(QMainWindow):
             return None
         saved_plane, current_plane, _ = planes
         diff_rgb = contour_diff_rgb(saved_plane.astype(np.int32),
-                                    current_plane.astype(np.int32))
+                                    current_plane.astype(np.int32),
+                                    upsample=2, emphasize_nodes=False)
         self._diff_diff_rgb = diff_rgb
-        self._diff_last_shape = diff_rgb.shape[:2]
+        self._diff_last_shape = saved_plane.shape
         return diff_rgb
 
     def _diff_refresh_overlay(self):
@@ -1257,20 +1270,20 @@ class MainW(QMainWindow):
         if diff_rgb is None:
             self._diff_close_existing()
             return
+        height, width = getattr(self, "_diff_last_shape", None) or diff_rgb.shape[:2]
+        extent = (-0.5, width - 0.5, height - 0.5, -0.5)
         if self._diff_img_im is None:
             self._diff_ax.clear()
             self._diff_img_im = self._diff_ax.imshow(
                 diff_rgb,
                 interpolation="nearest",
                 origin="upper",
-                extent=(-0.5, diff_rgb.shape[1] - 0.5, diff_rgb.shape[0] - 0.5, -0.5),
+                extent=extent,
             )
             self._diff_ax.axis("off")
         else:
             self._diff_img_im.set_data(diff_rgb)
-            self._diff_img_im.set_extent(
-                (-0.5, diff_rgb.shape[1] - 0.5, diff_rgb.shape[0] - 0.5, -0.5)
-            )
+            self._diff_img_im.set_extent(extent)
         self._diff_ax.set_xlim(*prev_xlim)
         self._diff_ax.set_ylim(*prev_ylim)
         self._diff_clamp_view()
@@ -1295,7 +1308,8 @@ class MainW(QMainWindow):
     def _diff_get_bounds(self):
         if self._diff_diff_rgb is None:
             return None
-        height, width = self._diff_diff_rgb.shape[:2]
+        height, width = (getattr(self, "_diff_last_shape", None)
+                         or self._diff_diff_rgb.shape[:2])
         return (-0.5, width - 0.5, height - 0.5, -0.5)
 
     def _diff_clamp_view(self):
@@ -1525,8 +1539,13 @@ class MainW(QMainWindow):
         if mapped is None:
             self._diff_log("diff viewer click ignored (outside image extent)")
             return
-        yi, xi = mapped
-        rgb = self._diff_diff_rgb[yi, xi]
+        render_y, render_x = mapped
+        rgb = self._diff_diff_rgb[render_y, render_x]
+        render_height, render_width = self._diff_diff_rgb.shape[:2]
+        mask_height, mask_width = (getattr(self, "_diff_last_shape", None)
+                                   or (render_height, render_width))
+        yi = min(mask_height - 1, render_y * mask_height // render_height)
+        xi = min(mask_width - 1, render_x * mask_width // render_width)
         kind = self._diff_color_kind(rgb)
         self._diff_log(
             f"diff viewer click at (y={yi}, x={xi}) classified as '{kind}' with rgb={rgb.tolist()}"
@@ -1583,20 +1602,17 @@ class MainW(QMainWindow):
                                 "Install matplotlib to view segmentation diffs.")
             return
         seg_path = self._diff_seg_path
-        if seg_path is None or not os.path.exists(seg_path):
-            QMessageBox.warning(self, "Saved segmentation missing",
-                                "Expected _seg.npy not found for this image.")
-            return
         if self._diff_state_new is None:
             QMessageBox.information(self, "No model result",
                                     "Run a segmentation model before viewing the diff.")
             return
 
-        saved_state = self._diff_get_saved_state(reload=True)
+        reload_saved = seg_path is not None and os.path.exists(seg_path)
+        saved_state = self._diff_get_saved_state(reload=reload_saved)
         if saved_state is None:
             QMessageBox.critical(
-                self, "Failed to load _seg.npy",
-                f"Could not read {os.path.basename(seg_path)}.")
+                self, "Saved segmentation missing",
+                "Could not load masks for comparison.")
             return
         try:
             diff_rgb = self._diff_recompute_overlay()
@@ -1616,7 +1632,7 @@ class MainW(QMainWindow):
         self._diff_close_existing()
 
         fig, ax = plt.subplots(figsize=(6, 6))
-        height, width = diff_rgb.shape[:2]
+        height, width = getattr(self, "_diff_last_shape", None) or diff_rgb.shape[:2]
         im = ax.imshow(
             diff_rgb,
             interpolation="nearest",

@@ -6,7 +6,25 @@ import numpy as np
 import pytest
 
 from cellpose.gui import gui as gui_module
+from cellpose.contrib.diff import contour_diff_rgb
 from cellpose.gui.gui import MainW
+
+
+class _Button:
+
+    def __init__(self):
+        self.enabled = False
+        self.text = ""
+        self.tooltip = ""
+
+    def setEnabled(self, enabled):
+        self.enabled = enabled
+
+    def setText(self, text):
+        self.text = text
+
+    def setToolTip(self, tooltip):
+        self.tooltip = tooltip
 
 
 def test_store_new_state_preserves_saved_override():
@@ -24,6 +42,43 @@ def test_store_new_state_preserves_saved_override():
     assert parent._diff_state_old_manual_override is True
     np.testing.assert_array_equal(
         parent._diff_state_new["masks"], parent.cellpix)
+
+
+def test_loaded_mask_baseline_enables_diff_and_reset_without_seg_npy():
+    saved = {"masks": np.zeros((1, 2, 2), dtype=np.uint16)}
+    parent = SimpleNamespace(
+        diffButton=_Button(),
+        maskToggleButton=_Button(),
+        _diff_seg_path=None,
+        _diff_state_new={"masks": np.ones((1, 2, 2), dtype=np.uint16)},
+        _diff_showing_restored=False,
+        _diff_get_saved_state=lambda reload=False: saved,
+        _diff_can_reset=lambda: (True, ""),
+        NZ=1,
+    )
+
+    MainW._diff_update_button_state(parent)
+
+    assert parent.diffButton.enabled is True
+    assert parent.maskToggleButton.enabled is True
+
+
+def test_button_refresh_preserves_tif_mask_baseline(tmp_path):
+    saved = {"masks": np.zeros((1, 2, 2), dtype=np.uint16)}
+    refreshes = []
+    parent = SimpleNamespace(
+        filename=str(tmp_path / "image.tif"),
+        _diff_seg_path=None,
+        _diff_state_old=saved,
+        _diff_state_old_manual_override=True,
+        _diff_update_button_state=lambda: refreshes.append(True),
+    )
+
+    MainW._diff_refresh_seg_path(parent)
+
+    assert parent._diff_state_old is saved
+    assert parent._diff_state_old_manual_override is True
+    assert refreshes == [True]
 
 
 def test_accept_new_uses_fresh_saved_side_label():
@@ -238,8 +293,9 @@ def test_gradxy_click_requires_primary_button():
     assert updates == [(2.0, 4.0)]
 
 
-def test_diff_window_opens_in_normal_state(tmp_path, monkeypatch):
+def test_tif_baseline_diff_window_opens_without_seg_path(monkeypatch):
     subplots_kwargs = {}
+    reload_values = []
     window_state = SimpleNamespace(normal_calls=0)
     window_state.showNormal = lambda: setattr(
         window_state, "normal_calls", window_state.normal_calls + 1)
@@ -262,14 +318,13 @@ def test_diff_window_opens_in_normal_state(tmp_path, monkeypatch):
         set_xlim=lambda *args: None,
         set_ylim=lambda *args: None,
     )
-    seg_path = tmp_path / "image_seg.npy"
-    seg_path.touch()
     parent = SimpleNamespace(
-        _diff_seg_path=str(seg_path),
+        _diff_seg_path=None,
         _diff_state_new={"masks": np.zeros((1, 2, 2), dtype=np.uint16)},
-        _diff_get_saved_state=lambda reload: {
-            "masks": np.zeros((1, 2, 2), dtype=np.uint16)
-        },
+        _diff_get_saved_state=lambda reload: (
+            reload_values.append(reload) or
+            {"masks": np.zeros((1, 2, 2), dtype=np.uint16)}
+        ),
         _diff_recompute_overlay=lambda: np.zeros((2, 2, 3), dtype=np.uint8),
         _diff_close_existing=lambda: None,
         _diff_update_crosshair_lines=lambda: None,
@@ -288,4 +343,49 @@ def test_diff_window_opens_in_normal_state(tmp_path, monkeypatch):
     MainW.show_segmentation_diff(parent)
 
     assert subplots_kwargs["figsize"] == (6, 6)
+    assert reload_values == [False]
     assert window_state.normal_calls == 1
+
+
+def test_diff_contours_are_one_pixel_after_2x_upsampling():
+    saved = np.array([[0, 1], [0, 1]], dtype=np.int32)
+    current = np.zeros_like(saved)
+
+    rgb = contour_diff_rgb(
+        saved,
+        current,
+        upsample=2,
+        tol_pixels=0,
+        min_component_size=1,
+        connectivity=4,
+        emphasize_nodes=False,
+    )
+
+    assert rgb.shape == (4, 4, 3)
+    boundary = np.any(rgb != 0, axis=-1)
+    assert np.flatnonzero(np.any(boundary, axis=0)).tolist() == [1]
+
+
+def test_diff_click_maps_2x_render_pixel_to_mask_pixel():
+    axis = object()
+    accepted = []
+    diff_rgb = np.zeros((4, 4, 3), dtype=np.uint8)
+    diff_rgb[1, 1] = [255, 80, 255]
+    image = SimpleNamespace(get_extent=lambda: (-0.5, 1.5, 1.5, -0.5))
+    parent = SimpleNamespace(
+        _diff_ax=axis,
+        _diff_img_im=image,
+        _diff_diff_rgb=diff_rgb,
+        _diff_last_shape=(2, 2),
+        _diff_click_to_indices=lambda x, y: MainW._diff_click_to_indices(
+            parent, x, y),
+        _diff_color_kind=MainW._diff_color_kind,
+        _diff_accept_old_at=lambda y, x: accepted.append((y, x)) or True,
+        _diff_accept_new_at=lambda y, x: False,
+        _diff_log=lambda message: None,
+    )
+    event = SimpleNamespace(inaxes=axis, button=1, xdata=0.0, ydata=0.0)
+
+    MainW._on_diff_click(parent, event)
+
+    assert accepted == [(0, 0)]

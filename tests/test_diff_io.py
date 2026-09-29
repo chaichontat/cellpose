@@ -86,6 +86,26 @@ def test_autoload_masks_does_not_override_seg_npy(tmp_path, monkeypatch):
     assert "load_masks" not in events
 
 
+def test_load_masks_registers_diff_baseline(tmp_path, monkeypatch):
+    events: list[str] = []
+    parent = SimpleNamespace(
+        NZ=1,
+        ncells=0,
+        _diff_store_current_as_saved=lambda: events.append("baseline"),
+        update_layer=lambda: events.append("update"),
+        update_plot=lambda: events.append("plot"),
+    )
+    mask_path = tmp_path / "sample_masks.tif"
+    mask_path.touch()
+    masks = np.array([[0, 1], [0, 0]], dtype=np.uint16)
+    monkeypatch.setattr(io, "imread", lambda _: masks)
+    monkeypatch.setattr(io, "_masks_to_gui", lambda *args, **kwargs: None)
+
+    io._load_masks(parent, filename=str(mask_path))
+
+    assert events == ["baseline", "update", "plot"]
+
+
 def test_failed_seg_load_does_not_restore_diff(tmp_path):
     events: list[str] = []
     parent = _parent(events)
